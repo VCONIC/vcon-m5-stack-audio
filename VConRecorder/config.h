@@ -23,7 +23,7 @@
 
 // Firmware version — must match /public/version.txt on the OTA server
 // when this build is the current release.
-#define FIRMWARE_VERSION      "1.0.4"
+#define FIRMWARE_VERSION      "1.0.5"
 
 // OTA endpoints — served as static files from the same Replit host
 #define OTA_VERSION_URL       "https://vcon-gateway.replit.app/api/ota/version.txt"
@@ -41,7 +41,7 @@
 
 // Recording duration — default set here, overridden at runtime via 'dur' serial command.
 // Stored in flash (Preferences key "rec_dur") and survives power cycles.
-#define RECORD_DURATION_SEC     60   // default: 60 s per chunk
+#define RECORD_DURATION_SEC     45   // default: 45 s per chunk (continuous mode)
 #define MIN_RECORD_DURATION_SEC 10   // shortest allowed (codec settle overhead)
 #define MAX_RECORD_DURATION_SEC 120  // longest allowed (PSRAM budget; see note below)
 

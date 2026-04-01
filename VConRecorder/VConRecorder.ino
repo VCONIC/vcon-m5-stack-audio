@@ -148,10 +148,11 @@ const unsigned long DISPLAY_INTERVAL_MS = 300;
 // =============================================================================
 
 enum UIScreen : uint8_t {
-    SCREEN_HOME   = 0,
-    SCREEN_STATUS = 1,
-    SCREEN_CONFIG = 2,
-    SCREEN_TOOLS  = 3
+    SCREEN_HOME     = 0,
+    SCREEN_STATUS   = 1,
+    SCREEN_CONFIG   = 2,
+    SCREEN_TOOLS    = 3,
+    SCREEN_DURATION = 4   // interactive duration picker
 };
 
 UIScreen currentScreen = SCREEN_HOME;
@@ -159,6 +160,10 @@ UIScreen currentScreen = SCREEN_HOME;
 // Inactivity timer — return to HOME after 60 s without a button press
 unsigned long lastButtonMs           = 0;
 const unsigned long INACTIVITY_TIMEOUT_MS = 60000UL;
+
+// Duration picker — scratch value while on SCREEN_DURATION.
+// Committed to recordDurationSec only when the user presses SAVE.
+uint32_t durEditPending = 0;
 
 // TOOLS screen state machine
 enum ToolsItem : uint8_t {
@@ -1637,8 +1642,94 @@ void drawConfigScreen() {
     }
 
     // Button row
-    drawButtonRow("HOME", "--", "--",
-                  VC_GREEN, TFT_DARKGREY, TFT_DARKGREY);
+    drawButtonRow("HOME", "SET DUR", "--",
+                  VC_GREEN, VC_GREEN, TFT_DARKGREY);
+}
+
+// =============================================================================
+// UI: Duration picker screen
+// =============================================================================
+
+void drawDurationScreen() {
+    // Header bar
+    M5.Display.fillRect(0, UI_CONTENT_Y, SCREEN_W, 14, VC_GREEN);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_BLACK, VC_GREEN);
+    M5.Display.setCursor(4, UI_CONTENT_Y + 3);
+    M5.Display.print("RECORDING DURATION");
+    M5.Display.fillRect(0, UI_CONTENT_Y + 14, SCREEN_W, UI_CONTENT_H - 14, TFT_BLACK);
+
+    bool cont = (durEditPending <= CONT_MAX_DURATION_SEC);
+
+    // ── Large centred value ──────────────────────────────────────────────────
+    // Size-5 char: 6×8 × 5 = 30×40 px per glyph
+    char nbuf[8];
+    snprintf(nbuf, sizeof(nbuf), "%u", durEditPending);
+    int numGlyphs = strlen(nbuf);
+    int numW = numGlyphs * 30 + 30;   // digits + " s" (2 glyphs × 30/2 ≈ rough)
+    int numX = (SCREEN_W - numW) / 2;
+    if (numX < 4) numX = 4;
+    M5.Display.setTextSize(5);
+    M5.Display.setTextColor(cont ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
+    M5.Display.setCursor(numX, 28);
+    M5.Display.print(nbuf);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.print(" s");
+
+    // ── Range bar (y=90) ────────────────────────────────────────────────────
+    const int bx = 10, by = 92, bw = SCREEN_W - 20, bh = 12;
+    float frac = (float)(durEditPending - MIN_RECORD_DURATION_SEC) /
+                 (float)(MAX_RECORD_DURATION_SEC - MIN_RECORD_DURATION_SEC);
+    drawProgressBar(bx, by, bw, bh, frac, cont ? TFT_GREEN : TFT_YELLOW);
+
+    // Tick line at CONT_MAX_DURATION_SEC
+    int contMaxX = bx + (int)((float)(CONT_MAX_DURATION_SEC - MIN_RECORD_DURATION_SEC) /
+                               (float)(MAX_RECORD_DURATION_SEC - MIN_RECORD_DURATION_SEC) * bw);
+    M5.Display.drawFastVLine(contMaxX, by - 5, bh + 10, TFT_CYAN);
+
+    // Min / CONT_MAX / Max labels
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    M5.Display.setCursor(bx, by + bh + 4);
+    M5.Display.printf("%us", MIN_RECORD_DURATION_SEC);
+    M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+    char cmLabel[8]; snprintf(cmLabel, sizeof(cmLabel), "%us", CONT_MAX_DURATION_SEC);
+    int cmLabelX = contMaxX - (int)(strlen(cmLabel) * 6) / 2;
+    M5.Display.setCursor(cmLabelX, by - 14);
+    M5.Display.print(cmLabel);
+    M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    char maxLabel[8]; snprintf(maxLabel, sizeof(maxLabel), "%us", MAX_RECORD_DURATION_SEC);
+    M5.Display.setCursor(bx + bw - (int)strlen(maxLabel) * 6, by + bh + 4);
+    M5.Display.print(maxLabel);
+
+    // ── Mode badge ──────────────────────────────────────────────────────────
+    M5.Display.setTextSize(1);
+    if (cont) {
+        M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+        M5.Display.setCursor(10, 134);
+        M5.Display.print("\x7e CONTINUOUS  (zero-gap dual-buffer)");
+    } else {
+        M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.setCursor(10, 134);
+        M5.Display.print("\x7e SINGLE-SHOT  (>45s, uploads between chunks)");
+    }
+
+    // ── Hint line ───────────────────────────────────────────────────────────
+    M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    M5.Display.setCursor(10, 152);
+    M5.Display.printf("Steps: 5 s  |  SAVE stores to flash");
+
+    // Unsaved-change indicator
+    if (durEditPending != recordDurationSec) {
+        M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.setCursor(10, 166);
+        M5.Display.printf("Current: %us  \x7e  pending: %us",
+                          recordDurationSec, durEditPending);
+    }
+
+    drawButtonRow("LESS", "SAVE", "MORE",
+                  VC_GREEN, TFT_GREEN, VC_GREEN);
 }
 
 // =============================================================================
@@ -1751,10 +1842,11 @@ void updateDisplay() {
     M5.Display.startWrite();
     drawHazard(0, 0, SCREEN_W, UI_TOP_H);
     switch (currentScreen) {
-        case SCREEN_HOME:   drawHomeScreen();   break;
-        case SCREEN_STATUS: drawStatusScreen(); break;
-        case SCREEN_CONFIG: drawConfigScreen(); break;
-        case SCREEN_TOOLS:  drawToolsScreen();  break;
+        case SCREEN_HOME:     drawHomeScreen();     break;
+        case SCREEN_STATUS:   drawStatusScreen();   break;
+        case SCREEN_CONFIG:   drawConfigScreen();   break;
+        case SCREEN_TOOLS:    drawToolsScreen();    break;
+        case SCREEN_DURATION: drawDurationScreen(); break;
     }
     M5.Display.endWrite();
 }
@@ -1996,6 +2088,45 @@ void handleButtons() {
 
     case SCREEN_CONFIG:
         if (M5.BtnA.wasPressed()) currentScreen = SCREEN_HOME;
+        if (M5.BtnB.wasPressed()) {
+            durEditPending = recordDurationSec;   // seed picker with live value
+            currentScreen  = SCREEN_DURATION;
+        }
+        break;
+
+    case SCREEN_DURATION:
+        if (M5.BtnA.wasPressed()) {
+            // LESS — decrease by 5 s, clamp at minimum
+            if (durEditPending > MIN_RECORD_DURATION_SEC) {
+                uint32_t next = durEditPending - 5;
+                durEditPending = (next < MIN_RECORD_DURATION_SEC)
+                                 ? MIN_RECORD_DURATION_SEC : next;
+            }
+        }
+        if (M5.BtnC.wasPressed()) {
+            // MORE — increase by 5 s, clamp at maximum
+            if (durEditPending < MAX_RECORD_DURATION_SEC) {
+                uint32_t next = durEditPending + 5;
+                durEditPending = (next > MAX_RECORD_DURATION_SEC)
+                                 ? MAX_RECORD_DURATION_SEC : next;
+            }
+        }
+        if (M5.BtnB.wasPressed()) {
+            // SAVE — commit and free old buffers so they reallocate at new size
+            if (appState == STATE_RECORDING || appState == STATE_CONTINUOUS ||
+                appState == STATE_ENCODING  || appState == STATE_UPLOADING) {
+                // Can't change mid-recording — silently ignore (screen shows old value)
+            } else {
+                recordDurationSec = durEditPending;
+                freeAudioBuffers();
+                saveConfig();
+                Serial.printf("[dur] Duration set to %u s (%s)\n",
+                              recordDurationSec,
+                              recordDurationSec <= CONT_MAX_DURATION_SEC
+                              ? "continuous" : "single-shot");
+            }
+            currentScreen = SCREEN_CONFIG;
+        }
         break;
 
     case SCREEN_TOOLS:
