@@ -21,10 +21,11 @@ vCon JSON, organized into date/hour directories with automatic rotation.
 7. [SD Card Storage](#7-sd-card-storage)
 8. [Memory Architecture](#8-memory-architecture)
 9. [Build & Flash](#9-build--flash)
-10. [Connecting via USB from macOS Terminal](#10-connecting-via-usb-from-macos-terminal)
-11. [Troubleshooting](#11-troubleshooting)
-12. [Project Structure](#12-project-structure)
-13. [Dependencies](#13-dependencies)
+10. [OTA Firmware Updates](#10-ota-firmware-updates)
+11. [Connecting via USB from macOS Terminal](#11-connecting-via-usb-from-macos-terminal)
+12. [Troubleshooting](#12-troubleshooting)
+13. [Project Structure](#13-project-structure)
+14. [Dependencies](#14-dependencies)
 
 ---
 
@@ -231,6 +232,7 @@ Print a full status report:
 === vCon Recorder Status ===
 Device ID:   VC-832924
 MAC Address: 84:1f:e8:83:29:24
+Firmware:    1.0.0
 Device Token: dvt_abc123  (or "(none — using MAC routing)")
 WiFi SSID:   barnhill tavern
 WiFi Status: Connected
@@ -499,18 +501,24 @@ alias arduino-cli="/Applications/Arduino\ IDE.app/Contents/Resources/app/lib/bac
 
 ### Compile
 
+The sketch requires the **Minimal SPIFFS (1.9 MB APP with OTA)** partition scheme
+so the ESP32 has two equal-sized OTA partitions for over-the-air updates.
+Pass it via the FQBN `PartitionScheme` option:
+
 ```bash
 arduino-cli compile \
-  --fqbn esp32:esp32:m5stack_core2 \
-  --build-property "build.partitions=default_16MB" \
+  --fqbn esp32:esp32:m5stack_core2:PartitionScheme=min_spiffs \
   VConRecorder/
 ```
 
 A successful build reports roughly:
 ```
-Sketch uses 1403155 bytes (21%) of program storage space.
+Sketch uses 1410907 bytes (71%) of program storage space.  Maximum is 1966080 bytes.
 Global variables use 52268 bytes (1%) of dynamic memory.
 ```
+
+> **Why 71%?** The `min_spiffs` scheme allocates two 1.9 MB OTA app partitions.
+> The sketch fits with ~555 KB to spare — enough headroom for future growth.
 
 ### Flash
 
@@ -532,7 +540,88 @@ pkill -f "screen.*usbserial"
 
 ---
 
-## 10. Connecting via USB from macOS Terminal
+## 10. OTA Firmware Updates
+
+The device checks for a firmware update on every boot, immediately after
+WiFi connects. If a newer version is available it downloads and flashes the
+binary in place, then reboots into the new firmware automatically — no serial
+cable or computer required.
+
+### How it works
+
+```
+boot → WiFi connected
+         │
+         ▼
+   GET /version.txt        ← plain-text remote version string  (e.g. "1.0.1")
+         │
+   compare to FIRMWARE_VERSION baked into this build
+         │
+   equal? ──── YES ──▶  skip, continue normal startup
+         │
+         NO
+         ▼
+   GET /firmware.bin       ← raw ESP32 .bin, Content-Length required
+         │
+   stream into the inactive OTA partition via ESP32 Update library
+         │
+   reboot into new firmware
+```
+
+### Version contract
+
+| Scenario | Behaviour |
+|----------|-----------|
+| Remote version == local | Skip update, log `[OTA] firmware is current` |
+| Remote version != local | Download and flash, then reboot |
+| `/version.txt` returns non-200 | Log error, continue boot normally |
+| `/firmware.bin` missing Content-Length | Abort, continue boot normally |
+| Flash write error | Log error, continue boot normally (old firmware intact) |
+
+### Serial output
+
+```
+[OTA] local=1.0.0  remote=1.0.1
+[OTA] update available (1.0.0 → 1.0.1), downloading...
+[OTA] binary size: 1410907 bytes
+[OTA]  141090 / 1410907 bytes (10%)
+[OTA]  282180 / 1410907 bytes (20%)
+...
+[OTA] 1410907 / 1410907 bytes (100%)
+[OTA] success — rebooting in 1 s...
+```
+
+### Shipping a firmware update
+
+1. **Export the compiled binary** in Arduino IDE: *Sketch → Export Compiled Binary*.
+   The file lands at `VConRecorder/build/esp32.esp32.m5stack_core2/VConRecorder.ino.bin`.
+2. **Rename** it `firmware.bin`.
+3. **Upload `firmware.bin`** to the OTA server (Replit: *Files → public → firmware.bin*).
+4. **Update `version.txt`** on the server to the new version string (e.g. `1.0.1`).
+
+> ⚠️ **Deploy order matters.** Always upload `firmware.bin` *before* updating
+> `version.txt`. Devices check the version string first — if `version.txt`
+> already says `1.0.1` but `firmware.bin` is still the old build, devices will
+> try to download a mismatched binary.
+
+### OTA configuration (`config.h`)
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `FIRMWARE_VERSION` | `"1.0.0"` | Version baked into this build; must match `version.txt` when this is the current release |
+| `OTA_VERSION_URL` | `https://vcon-gateway.replit.app/version.txt` | Plain-text version endpoint |
+| `OTA_FIRMWARE_URL` | `https://vcon-gateway.replit.app/firmware.bin` | Raw binary download endpoint |
+
+### Partition scheme requirement
+
+OTA requires two equal-sized app partitions on the ESP32. The sketch must be
+compiled with `PartitionScheme=min_spiffs` (see [§9 Build & Flash](#9-build--flash)).
+Building with the default partition scheme disables OTA and the
+`Update.begin()` call will fail at runtime.
+
+---
+
+## 11. Connecting via USB from macOS Terminal
 
 No extra software is required — macOS ships with the `screen` utility.
 
@@ -591,7 +680,7 @@ Open the terminal session **before** pressing reset to see every `[init]`,
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 ### WiFi will not connect / "sta is connecting, cannot set config"
 
@@ -658,7 +747,7 @@ for a generic ESP32 or M5Stack Core (non-Core2).
 
 ---
 
-## 12. Project Structure
+## 13. Project Structure
 
 ```
 vcon-m5-stack-audio/
@@ -666,7 +755,8 @@ vcon-m5-stack-audio/
 ├── CAPTIVE_PORTAL_IMPLEMENTATION_PLAN.md
 └── VConRecorder/
     ├── VConRecorder.ino              ← Main Arduino sketch (~1 900 lines)
-    ├── config.h                      ← Compile-time defaults & buffer constants
+    ├── config.h                      ← Compile-time defaults, buffer constants & OTA URLs
+    ├── ota.h                         ← OTA update logic (HTTP poll + ESP32 Update library)
     └── logo.h                        ← VConic logo (RGB565, 310×110 px, PROGMEM)
 ```
 
@@ -698,7 +788,7 @@ vcon-m5-stack-audio/
 
 ---
 
-## 13. Dependencies
+## 14. Dependencies
 
 | Library | Version | Source |
 |---------|---------|--------|
@@ -715,4 +805,4 @@ except M5Unified which must be installed separately.
 
 ---
 
-*Updated 2026-04-01 — firmware: continuous dual-buffer mode, VConic gateway, SD rotation*
+*Updated 2026-04-01 — firmware: continuous dual-buffer mode, VConic gateway, SD rotation, OTA updates*
