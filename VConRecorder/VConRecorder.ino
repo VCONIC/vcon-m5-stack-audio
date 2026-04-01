@@ -53,6 +53,13 @@ enum AppState {
 // text size 1 with black foreground, and echoes the VConic logo palette.
 #define VC_GREEN 0x3666u
 
+// UI layout — persistent chrome heights
+#define UI_TOP_H     8    // hazard stripe
+#define UI_CONTENT_Y 8    // content area starts here
+#define UI_CONTENT_H 186  // 240 - 8 - 46
+#define UI_BTN_Y     194  // button row y
+#define UI_BTN_H     46   // button row height
+
 // =============================================================================
 // Globals
 // =============================================================================
@@ -135,6 +142,48 @@ int      levelIdx = 0;
 // Display
 unsigned long lastDisplayMs = 0;
 const unsigned long DISPLAY_INTERVAL_MS = 300;
+
+// =============================================================================
+// UI Screen Navigation
+// =============================================================================
+
+enum UIScreen : uint8_t {
+    SCREEN_HOME   = 0,
+    SCREEN_STATUS = 1,
+    SCREEN_CONFIG = 2,
+    SCREEN_TOOLS  = 3
+};
+
+UIScreen currentScreen = SCREEN_HOME;
+
+// Inactivity timer — return to HOME after 60 s without a button press
+unsigned long lastButtonMs           = 0;
+const unsigned long INACTIVITY_TIMEOUT_MS = 60000UL;
+
+// TOOLS screen state machine
+enum ToolsItem : uint8_t {
+    TOOL_WIFI_TEST = 0,
+    TOOL_OTA_TEST  = 1,
+    TOOL_POST_TEST = 2,
+    TOOL_SD_SHOW   = 3,
+    TOOL_RESTART   = 4,
+    TOOL_COUNT     = 5
+};
+
+enum ToolsPhase : uint8_t {
+    TPHASE_SELECT  = 0,
+    TPHASE_CONFIRM = 1,
+    TPHASE_RUNNING = 2,
+    TPHASE_RESULT  = 3
+};
+
+uint8_t    toolsSelectedItem = 0;
+ToolsPhase toolsPhase        = TPHASE_SELECT;
+String     toolsResultLine1  = "";
+String     toolsResultLine2  = "";
+bool       toolsResultOK     = false;
+unsigned long toolsResultMs  = 0;
+const unsigned long TOOLS_RESULT_TIMEOUT_MS = 8000UL;
 
 // Wifi retry
 const unsigned long WIFI_RETRY_MS = 30000;
@@ -1195,215 +1244,138 @@ void drawProgressBar(int x, int y, int w, int h, float pct, uint16_t fillCol = T
 }
 
 // =============================================================================
-// Full UI redraw
+// UI: Button row helper
 // =============================================================================
-//
-// Layout (320 × 240):
-//
-//  y  0- 7  : hazard strip
-//  y  8-68  : TOP ROW
-//    x   0- 79 (80 px): WIFI panel
-//    x  80-239 (160px): TIME panel
-//    x 240-319 ( 80px): STATE panel
-//  y 69-155 : MIDDLE ROW (87 px tall)
-//    x   0- 79 (80 px): TIMER panel
-//    x  80-239 (160px): AUDIO panel (level bars)
-//    x 240-319 ( 80px): vCON panel
-//  y156-193 : STATUS ROW (38 px)
-//  y194-239 : BUTTON ROW (46 px)
 
-void updateDisplay() {
-    // Acquire the SPI bus for the whole redraw so every fillRect/drawRect/print
-    // is sent as a single batched transaction.  Without this each primitive
-    // individually toggles CS, and the inter-call gaps appear as visible flicker.
-    M5.Display.startWrite();
+void drawButtonRow(const char* labelA, const char* labelB, const char* labelC,
+                   uint16_t colA = VC_GREEN,
+                   uint16_t colB = VC_GREEN,
+                   uint16_t colC = VC_GREEN) {
+    M5.Display.fillRect(0, UI_BTN_Y, SCREEN_W, UI_BTN_H, TFT_BLACK);
+    M5.Display.drawFastHLine(0, UI_BTN_Y, SCREEN_W, VC_GREEN);
+    const int btnW = SCREEN_W / 3;
+    const char* labels[3] = { labelA, labelB, labelC };
+    uint16_t    colors[3] = { colA,   colB,   colC   };
+    for (int i = 0; i < 3; i++) {
+        int bx = i * btnW;
+        if (i < 2) M5.Display.drawFastVLine(bx + btnW, UI_BTN_Y + 1, UI_BTN_H - 1, VC_GREEN);
+        M5.Display.drawRect(bx + 4, UI_BTN_Y + 4, btnW - 8, UI_BTN_H - 8, colors[i]);
+        M5.Display.setTextSize(2);
+        int lw = (int)strlen(labels[i]) * 12;
+        M5.Display.setTextColor(colors[i], TFT_BLACK);
+        M5.Display.setCursor(bx + (btnW - lw) / 2, UI_BTN_Y + 14);
+        M5.Display.print(labels[i]);
+    }
+}
 
-    // ---- Hazard strip ----
-    drawHazard(0, 0, SCREEN_W, 8);
+// =============================================================================
+// UI: Home screen
+// =============================================================================
 
-    // ====================================================================
-    // TOP ROW
-    // ====================================================================
-
-    // -- WIFI panel (x=0, y=8, 80×60) --
-    uint16_t wifiLabelBg = wifiConnected ? 0x03E0u : TFT_RED;  // green or red
-    drawPanel(0, 8, 80, 60, "WIFI", wifiLabelBg);
+void drawHomeScreen() {
+    // ── CONNECTION BAND (y=8..67) ──────────────────────────────────────────
+    // Left: WiFi panel (x=0..159)
+    uint16_t wfBg = wifiConnected ? VC_GREEN : TFT_RED;
+    drawPanel(0, UI_CONTENT_Y, 160, 60, "WIFI", wfBg);
     M5.Display.setTextSize(1);
     if (wifiConnected) {
-        M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+        M5.Display.setTextColor(TFT_GREEN,  TFT_BLACK);
         M5.Display.setCursor(3, 23);  M5.Display.print("CONNECTED");
-        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.setTextColor(TFT_WHITE,  TFT_BLACK);
         M5.Display.setCursor(3, 34);  M5.Display.printf("%d dBm", wifiRSSI);
-        // Truncate SSID to fit 80px
-        String s = wifiSSID; if (s.length() > 12) s = s.substring(0, 11) + "~";
+        String s = wifiSSID; if (s.length() > 18) s = s.substring(0, 17) + "~";
         M5.Display.setCursor(3, 45);  M5.Display.print(s);
-        M5.Display.setCursor(3, 56);
-        M5.Display.print(ntpSynced ? "NTP OK" : "No NTP");
+        M5.Display.setTextColor(ntpSynced ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
+        M5.Display.setCursor(3, 56);  M5.Display.print(ntpSynced ? "NTP OK" : "No NTP");
     } else {
         M5.Display.setTextColor(TFT_RED, TFT_BLACK);
-        M5.Display.setCursor(3, 25);  M5.Display.print("NO WIFI");
+        M5.Display.setCursor(3, 25); M5.Display.print("NO WIFI");
         M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        M5.Display.setCursor(3, 38);  M5.Display.print("Use serial:");
-        M5.Display.setCursor(3, 50);  M5.Display.print("wifi ssid pw");
+        M5.Display.setCursor(3, 38); M5.Display.print("wifi <ssid> <pw>");
     }
 
-    // -- TIME panel (x=80, y=8, 160×60) --
-    M5.Display.drawRect(80, 8, 160, 60, VC_GREEN);
-    M5.Display.fillRect(81, 9, 158, 10, VC_GREEN);
+    // Right: Time panel (x=160..319)
+    M5.Display.drawRect(160, UI_CONTENT_Y, 160, 60, VC_GREEN);
+    M5.Display.fillRect(161, UI_CONTENT_Y+1, 158, 10, VC_GREEN);
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(TFT_BLACK, VC_GREEN);
-    M5.Display.setCursor(83, 11);
-    M5.Display.print("M5STACK VCON RECORDER");
-    // Big time display (size 3 = 18×24 px per char)
+    M5.Display.setCursor(163, UI_CONTENT_Y+2);
+    M5.Display.print("  M5STACK VCON RECORDER");
     char tbuf[12], dbuf[12];
     getTimeDisplay(tbuf, sizeof(tbuf));
     getDateDisplay(dbuf, sizeof(dbuf));
     M5.Display.setTextSize(3);
     M5.Display.setTextColor(VC_GREEN, TFT_BLACK);
-    M5.Display.setCursor(88, 22);
-    M5.Display.print(tbuf);   // "HH:MM:SS" = 144px wide — fits in 158px
+    M5.Display.setCursor(168, UI_CONTENT_Y+14);
+    M5.Display.print(tbuf);
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5.Display.setCursor(107, 56);
+    M5.Display.setCursor(207, UI_CONTENT_Y+50);
     M5.Display.print(dbuf);
 
-    // -- STATE panel (x=240, y=8, 80×60) --
-    uint16_t stateBg   = VC_GREEN;
-    uint16_t stateTextCol = TFT_BLACK;
-    const char* stateStr  = "IDLE";
-    if (appState == STATE_RECORDING)  { stateBg = TFT_RED;    stateTextCol = TFT_WHITE;  stateStr = "RECORDING"; }
-    if (appState == STATE_CONTINUOUS) { stateBg = TFT_RED;   stateTextCol = TFT_WHITE;  stateStr = "LIVE";      }
-    if (appState == STATE_ENCODING)   { stateBg = VC_GREEN;  stateTextCol = TFT_BLACK;  stateStr = "ENCODING";  }
-    if (appState == STATE_UPLOADING)  { stateBg = VC_GREEN;  stateTextCol = TFT_BLACK;  stateStr = "UPLOADING"; }
-    if (appState == STATE_SUCCESS)    { stateBg = TFT_GREEN; stateTextCol = TFT_BLACK;  stateStr = "SUCCESS";   }
-    if (appState == STATE_ERROR)      { stateBg = TFT_RED;   stateTextCol = TFT_WHITE;  stateStr = "ERROR";     }
-    drawPanel(240, 8, 80, 60, "STATE", stateBg);
-    M5.Display.setTextSize(1);
-    M5.Display.setTextColor(stateTextCol, TFT_BLACK);
-    M5.Display.setCursor(243, 23);
+    // ── STATE BAND (y=68..127) ─────────────────────────────────────────────
+    bool activeRec = (appState == STATE_RECORDING || appState == STATE_CONTINUOUS);
+    uint16_t stateBg  = VC_GREEN;
+    uint16_t stateFg  = TFT_BLACK;
+    const char* stateStr = "IDLE";
+    if (appState == STATE_RECORDING)  { stateBg = TFT_RED;   stateFg = TFT_WHITE; stateStr = "RECORDING";  }
+    if (appState == STATE_CONTINUOUS) { stateBg = TFT_RED;   stateFg = TFT_WHITE; stateStr = "LIVE";        }
+    if (appState == STATE_ENCODING)   { stateBg = TFT_CYAN;  stateFg = TFT_BLACK; stateStr = "ENCODING";   }
+    if (appState == STATE_UPLOADING)  { stateBg = TFT_CYAN;  stateFg = TFT_BLACK; stateStr = "UPLOADING";  }
+    if (appState == STATE_SUCCESS)    { stateBg = TFT_GREEN; stateFg = TFT_BLACK; stateStr = "SUCCESS";     }
+    if (appState == STATE_ERROR)      { stateBg = TFT_RED;   stateFg = TFT_WHITE; stateStr = "ERROR";       }
+    drawPanel(0, 68, SCREEN_W, 60, "STATE", stateBg, stateFg);
+
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(stateFg == TFT_BLACK ? stateBg : TFT_WHITE, TFT_BLACK);
+    int sw = (int)strlen(stateStr) * 12;
+    M5.Display.setCursor((SCREEN_W - sw) / 2, 83);
     M5.Display.print(stateStr);
 
-    // Uptime
-    unsigned long sec = millis() / 1000;
-    char uptimeBuf[12];
-    snprintf(uptimeBuf, sizeof(uptimeBuf), "%02lu:%02lu:%02lu",
-             (sec / 3600) % 24, (sec / 60) % 60, sec % 60);
-    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5.Display.setCursor(243, 36); M5.Display.print("UP:");
-    M5.Display.setCursor(243, 47); M5.Display.print(uptimeBuf);
-    M5.Display.setCursor(243, 58);
-    M5.Display.printf("%uKB", ESP.getFreePsram() / 1024);
-
-    // ====================================================================
-    // MIDDLE ROW  (y=69..155)
-    // ====================================================================
-
-    // -- TIMER panel (x=0, y=69, 80×87) --
-    bool activeRec = (appState == STATE_RECORDING || appState == STATE_CONTINUOUS);
-    uint16_t timerBorder = activeRec ? TFT_RED : VC_GREEN;
-    drawPanel(0, 69, 80, 87, "RECORD", VC_GREEN, TFT_BLACK, timerBorder);
     M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    unsigned long sec = millis() / 1000;
+    char uptimeBuf[14];
+    snprintf(uptimeBuf, sizeof(uptimeBuf), "UP %02lu:%02lu:%02lu",
+             (sec / 3600) % 24, (sec / 60) % 60, sec % 60);
+    M5.Display.setCursor(3, 107);
+    M5.Display.print(uptimeBuf);
+    M5.Display.setCursor(3, 118);
+    M5.Display.printf("PSRAM %uKB free", ESP.getFreePsram() / 1024);
+
+    // Recording progress bar when active
     if (activeRec) {
+        float prog = recordingProgress();
+        uint16_t barCol = (appState == STATE_CONTINUOUS) ? VC_GREEN : TFT_RED;
+        drawProgressBar(160, 100, 158, 10, prog, barCol);
+        char timerbuf[20];
         unsigned long elapsed = (millis() - recordStartMs) / 1000;
-        char timerbuf[16];
-        snprintf(timerbuf, sizeof(timerbuf), "%02lu:%02lu/%02u:%02u",
+        snprintf(timerbuf, sizeof(timerbuf), "%02lu:%02lu / %02u:%02u",
                  elapsed / 60, elapsed % 60,
                  recordDurationSec / 60, recordDurationSec % 60);
-        M5.Display.setTextColor(TFT_RED, TFT_BLACK);
-        M5.Display.setCursor(3, 82);
-        M5.Display.print(appState == STATE_CONTINUOUS ? "* CONT" : "* REC");
-        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-        M5.Display.setCursor(3, 94);  M5.Display.print(timerbuf);
-        float prog = recordingProgress();
-        drawProgressBar(3, 108, 74, 10, prog, TFT_RED);
+        M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.setCursor(163, 88);
+        M5.Display.print(timerbuf);
         if (appState == STATE_CONTINUOUS) {
-            // Show chunk count instead of percentage
             M5.Display.setTextColor(VC_GREEN, TFT_BLACK);
-            M5.Display.setCursor(3, 122);
-            M5.Display.printf("#%u", (uint32_t)continuousChunks + 1);
-        } else {
-            M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
-            M5.Display.setCursor(3, 122);
-            M5.Display.printf("%d%%", (int)(prog * 100));
-        }
-    } else {
-        M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        M5.Display.setCursor(3, 82);
-        if (appState == STATE_IDLE || appState == STATE_SUCCESS || appState == STATE_ERROR) {
-            M5.Display.print("Press RUN");
-            M5.Display.setCursor(3, 93);
-            M5.Display.print("to record");
-        } else {
-            M5.Display.print("Processing");
-        }
-        // Show total/failed counts
-        M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
-        M5.Display.setCursor(3, 110); M5.Display.printf("OK:  %u", totalUploads);
-        M5.Display.setTextColor(TFT_RED, TFT_BLACK);
-        M5.Display.setCursor(3, 122); M5.Display.printf("Err: %u", failedUploads);
-        M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        M5.Display.setCursor(3, 134); M5.Display.printf("Buf: %zuKB", audioBufferIndex * 2 / 1024);
-    }
-
-    // -- AUDIO panel (x=80, y=69, 160×87) drawn directly --
-    {
-        const int px = 80, py = 69, pw = 160, ph = 87;
-        uint16_t audioBorder = activeRec ? TFT_RED : VC_GREEN;
-
-        M5.Display.fillRect(px, py, pw, ph, TFT_BLACK);
-        M5.Display.drawRect(px, py, pw, ph, audioBorder);
-        M5.Display.fillRect(px + 1, py + 1, pw - 2, 12, VC_GREEN);
-        M5.Display.setTextSize(1);
-        M5.Display.setTextColor(TFT_BLACK, VC_GREEN);
-        M5.Display.setCursor(px + 3, py + 3);
-        M5.Display.print("MICROPHONE INPUT");
-
-        // Bars sub-region: 1 px margin inside border, 14 px from top
-        const int bx0 = px + 1, by0 = py + 14, bw = pw - 2, bh = ph - 15;
-        const int barW = (bw - LEVEL_BARS) / LEVEL_BARS;  // = 8 px
-
-        // Baseline always visible
-        M5.Display.drawFastHLine(bx0, by0 + bh - 1, bw, 0x2945u);
-
-        if (activeRec) {
-            for (int i = 0; i < LEVEL_BARS; i++) {
-                int idx   = (levelIdx - LEVEL_BARS + i + LEVEL_BARS * 2) % LEVEL_BARS;
-                int level = levelHistory[idx];
-                int barH  = (int)((float)level / 32767.0f * (float)bh);
-                if (barH < 1) barH = 1;
-                int bx    = bx0 + i * (barW + 1);
-                uint16_t col = TFT_GREEN;
-                if      (barH > bh * 70 / 100) col = TFT_RED;
-                else if (barH > bh * 40 / 100) col = TFT_YELLOW;
-                M5.Display.fillRect(bx, by0 + bh - barH, barW, barH, col);
-            }
+            M5.Display.setCursor(163, 114);
+            M5.Display.printf("Chunk #%u", (uint32_t)continuousChunks + 1);
         }
     }
 
-    // -- vCON panel (x=240, y=69, 80×87) --
-    uint16_t vconBorder = (appState == STATE_SUCCESS) ? TFT_GREEN :
-                          (appState == STATE_ERROR)   ? TFT_RED : VC_GREEN;
-    drawPanel(240, 69, 80, 87, "vCON", VC_GREEN, TFT_BLACK, vconBorder);
+    // ── STATS BAND (y=128..155) ────────────────────────────────────────────
+    M5.Display.fillRect(0, 128, SCREEN_W, 28, TFT_BLACK);
+    M5.Display.drawRect(0, 128, SCREEN_W, 28, 0x2945u);
     M5.Display.setTextSize(1);
-    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5.Display.setCursor(243, 83);  M5.Display.print("UUID:");
-    // Show last 10 chars of UUID (unique part)
-    String uuidShort = lastVconUUID.length() > 10
-                       ? lastVconUUID.substring(lastVconUUID.length() - 10)
-                       : lastVconUUID;
-    M5.Display.setCursor(243, 94);  M5.Display.print(uuidShort);
-    M5.Display.setCursor(243, 107); M5.Display.print("HTTP:");
-    uint16_t httpCol = (lastHttpCode >= 200 && lastHttpCode < 300) ? TFT_GREEN :
-                       (lastHttpCode == 0) ? TFT_DARKGREY : TFT_RED;
-    M5.Display.setTextColor(httpCol, TFT_BLACK);
-    M5.Display.setCursor(243, 118);
-    if (lastHttpCode == 0) M5.Display.print("--");
-    else                   M5.Display.printf("%d", lastHttpCode);
-    M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    M5.Display.setCursor(243, 131);
-    M5.Display.printf("%.1fKB", (float)(audioBufferIndex * 2) / 1024.0f);
-    // In continuous mode show upload task state and chunk count
-    if (appState == STATE_CONTINUOUS) {
+    M5.Display.setTextColor(TFT_GREEN,  TFT_BLACK);
+    M5.Display.setCursor(4,  133); M5.Display.printf("OK:%u", totalUploads);
+    M5.Display.setTextColor(TFT_RED,    TFT_BLACK);
+    M5.Display.setCursor(70, 133); M5.Display.printf("Err:%u", failedUploads);
+    M5.Display.setTextColor(TFT_WHITE,  TFT_BLACK);
+    M5.Display.setCursor(4,  146); M5.Display.printf("dur:%us  HTTP:%d",
+                                   recordDurationSec,
+                                   lastHttpCode > 0 ? lastHttpCode : 0);
+    if (appState == STATE_CONTINUOUS || appState == STATE_UPLOADING) {
         const char* utsStr = "...";
         uint16_t utsCol = TFT_DARKGREY;
         switch (uploadTaskState) {
@@ -1413,180 +1385,623 @@ void updateDisplay() {
             case UTS_RETRY:     utsStr = "RTRY"; utsCol = TFT_YELLOW; break;
             case UTS_DONE_OK:   utsStr = "OK";   utsCol = TFT_GREEN;  break;
             case UTS_DONE_FAIL: utsStr = "FAIL"; utsCol = TFT_RED;    break;
-            default:            utsStr = "REC";  utsCol = VC_GREEN;   break;
+            default: break;
         }
         M5.Display.setTextColor(utsCol, TFT_BLACK);
-        M5.Display.setCursor(243, 143);
-        M5.Display.printf("%s #%u", utsStr, (uint32_t)continuousChunks);
-    } else {
-        uint16_t sdCol = sdReady ? TFT_GREEN : TFT_RED;
-        M5.Display.setTextColor(sdCol, TFT_BLACK);
-        M5.Display.setCursor(243, 143);
-        M5.Display.print(sdReady ? sdCardInfo.c_str() : "No SD");
+        M5.Display.setCursor(200, 133);
+        M5.Display.printf("%-4s #%u", utsStr, (uint32_t)continuousChunks);
     }
-    M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    M5.Display.setCursor(243, 153);
+    M5.Display.setTextColor(sdReady ? TFT_GREEN : TFT_DARKGREY, TFT_BLACK);
+    M5.Display.setCursor(200, 146);
     M5.Display.printf("sd:%u", sdSaved);
 
-    // ====================================================================
-    // STATUS ROW (y=156..193)
-    // ====================================================================
+    // ── STATUS ROW (y=156..193) ────────────────────────────────────────────
     M5.Display.fillRect(0, 156, SCREEN_W, 38, TFT_BLACK);
-    M5.Display.drawRect(0, 156, SCREEN_W, 38, 0x2945u);  // dark border
+    M5.Display.drawRect(0, 156, SCREEN_W, 38, 0x2945u);
+    M5.Display.setTextSize(1);
+    uint16_t statusCol = TFT_WHITE;
+    if (appState == STATE_SUCCESS) statusCol = TFT_GREEN;
+    if (appState == STATE_ERROR)   statusCol = TFT_RED;
+    M5.Display.setTextColor(statusCol, TFT_BLACK);
+    M5.Display.setCursor(4, 161);
+    M5.Display.print(lastStatus.c_str());
+    String urlShort = postURL;
+    if (urlShort.length() > 48) urlShort = urlShort.substring(0, 45) + "...";
+    M5.Display.setTextColor(0x867Bu, TFT_BLACK);
+    M5.Display.setCursor(4, 177);
+    M5.Display.print(urlShort.c_str());
 
-    if (appState == STATE_RECORDING || appState == STATE_CONTINUOUS) {
-        float prog = recordingProgress();
-        uint16_t barCol = (appState == STATE_CONTINUOUS) ? VC_GREEN : TFT_CYAN;
-        drawProgressBar(4, 159, SCREEN_W - 8, 14, prog, barCol);
-        M5.Display.setTextSize(1);
-        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-        M5.Display.setCursor(4, 177);
-        M5.Display.print(lastStatus.c_str());
+    // ── BUTTON ROW ─────────────────────────────────────────────────────────
+    bool idle    = (appState == STATE_IDLE || appState == STATE_SUCCESS || appState == STATE_ERROR);
+    bool busy    = (appState == STATE_ENCODING || appState == STATE_UPLOADING);
+    if (idle) {
+        drawButtonRow("RUN",    "CONFIG", "TOOLS",
+                      TFT_GREEN, VC_GREEN, VC_GREEN);
+    } else if (activeRec) {
+        drawButtonRow("--",     "STOP",   "STATUS",
+                      TFT_DARKGREY, TFT_RED, VC_GREEN);
     } else {
-        M5.Display.setTextSize(1);
-        uint16_t statusCol = TFT_WHITE;
-        if (appState == STATE_SUCCESS) statusCol = TFT_GREEN;
-        if (appState == STATE_ERROR)   statusCol = TFT_RED;
-        M5.Display.setTextColor(statusCol, TFT_BLACK);
-        M5.Display.setCursor(4, 163);
-        M5.Display.print(lastStatus.c_str());
-        // URL (truncated)
-        String urlShort = postURL;
-        if (urlShort.length() > 48) urlShort = urlShort.substring(0, 45) + "...";
-        M5.Display.setTextColor(0x867Bu, TFT_BLACK);   // muted blue-grey
-        M5.Display.setCursor(4, 177);
-        M5.Display.print(urlShort.c_str());
+        drawButtonRow("--",     "--",     "STATUS",
+                      TFT_DARKGREY, TFT_DARKGREY, VC_GREEN);
     }
-
-    // ====================================================================
-    // BUTTON ROW (y=194..239)
-    // ====================================================================
-    M5.Display.fillRect(0, 194, SCREEN_W, 46, TFT_BLACK);
-
-    // Divider line
-    M5.Display.drawFastHLine(0, 194, SCREEN_W, VC_GREEN);
-
-    // Three equal-width touch button zones (matching physical capacitive buttons A/B/C)
-    // A=RUN  B=STOP  C=CONFIG
-    const int btnW = SCREEN_W / 3;
-    const char* btnLabels[3]  = { "RUN", "STOP", "CONFIG" };
-    uint16_t    btnColors[3];
-    bool idleState = (appState == STATE_IDLE || appState == STATE_SUCCESS || appState == STATE_ERROR);
-    bool activeState = (appState == STATE_RECORDING || appState == STATE_CONTINUOUS ||
-                        appState == STATE_ENCODING  || appState == STATE_UPLOADING);
-    // RUN: green when idle
-    btnColors[0] = idleState ? TFT_GREEN : TFT_DARKGREY;
-    // STOP: red when recording or continuous
-    btnColors[1] = (appState == STATE_RECORDING || appState == STATE_CONTINUOUS) ? TFT_RED : TFT_DARKGREY;
-    // CONFIG: VC_GREEN when not busy
-    btnColors[2] = activeState ? TFT_DARKGREY : VC_GREEN;
-
-    for (int i = 0; i < 3; i++) {
-        int bx = i * btnW;
-        if (i < 2) M5.Display.drawFastVLine(bx + btnW, 195, 44, VC_GREEN);
-        // Button box
-        M5.Display.drawRect(bx + 4, 198, btnW - 8, 36, btnColors[i]);
-        // Label
-        M5.Display.setTextSize(2);
-        int labelW = strlen(btnLabels[i]) * 12;
-        M5.Display.setTextColor(btnColors[i], TFT_BLACK);
-        M5.Display.setCursor(bx + (btnW - labelW) / 2, 208);
-        M5.Display.print(btnLabels[i]);
-    }
-
-    M5.Display.endWrite();
 }
 
 // =============================================================================
-// Config Screen (modal)
+// UI: Status screen
 // =============================================================================
 
-void showConfig() {
-    M5.Display.fillScreen(TFT_BLACK);
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-    M5.Display.setCursor(10, 8);
-    M5.Display.print("CONFIGURATION");
-    M5.Display.drawFastHLine(0, 28, SCREEN_W, TFT_CYAN);
+void drawStatusScreen() {
+    bool activeRec = (appState == STATE_RECORDING || appState == STATE_CONTINUOUS);
 
+    // ── Header bar ─────────────────────────────────────────────────────────
+    M5.Display.fillRect(0, UI_CONTENT_Y, SCREEN_W, 14, VC_GREEN);
     M5.Display.setTextSize(1);
-    int y = 34;
-    const int lh = 16;
+    M5.Display.setTextColor(TFT_BLACK, VC_GREEN);
+    M5.Display.setCursor(4, UI_CONTENT_Y + 3);
+    M5.Display.print("STATUS \x7e RECORDING DASHBOARD");
+
+    // ── VU meter (y=22..81, 60px tall) ────────────────────────────────────
+    const int vx = 0, vy = 22, vw = SCREEN_W, vh = 60;
+    M5.Display.fillRect(vx, vy, vw, vh, TFT_BLACK);
+    M5.Display.drawRect(vx, vy, vw, vh, activeRec ? TFT_RED : VC_GREEN);
+    const int barCount = LEVEL_BARS;
+    const int barW     = (vw - 2 - barCount) / barCount;
+    if (activeRec) {
+        for (int i = 0; i < barCount; i++) {
+            int idx   = (levelIdx - barCount + i + barCount * 2) % barCount;
+            int level = levelHistory[idx];
+            int barH  = (int)((float)level / 32767.0f * (float)(vh - 2));
+            if (barH < 1) barH = 1;
+            int bx    = vx + 1 + i * (barW + 1);
+            uint16_t col = TFT_GREEN;
+            if      (barH > (vh-2) * 70 / 100) col = TFT_RED;
+            else if (barH > (vh-2) * 40 / 100) col = TFT_YELLOW;
+            M5.Display.fillRect(bx, vy + vh - 1 - barH, barW, barH, col);
+        }
+    } else {
+        M5.Display.drawFastHLine(vx+1, vy + vh/2, vw-2, 0x2945u);
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        M5.Display.setCursor(vx + vw/2 - 30, vy + vh/2 - 4);
+        M5.Display.print("not recording");
+    }
+
+    // ── Elapsed / progress (y=83..108) ────────────────────────────────────
+    M5.Display.fillRect(0, 83, SCREEN_W, 26, TFT_BLACK);
+    if (activeRec || appState == STATE_ENCODING || appState == STATE_UPLOADING) {
+        unsigned long elapsed = activeRec ? (millis() - recordStartMs) / 1000 : 0;
+        char timerbuf[24];
+        snprintf(timerbuf, sizeof(timerbuf), "%02lu:%02lu / %02u:%02u",
+                 elapsed / 60, elapsed % 60,
+                 recordDurationSec / 60, recordDurationSec % 60);
+        float prog = activeRec ? recordingProgress() : 1.0f;
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.setCursor(4, 85);
+        M5.Display.print(timerbuf);
+        M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.setCursor(200, 85);
+        M5.Display.printf("%d%%", (int)(prog * 100));
+        uint16_t barCol = (appState == STATE_CONTINUOUS) ? VC_GREEN :
+                          (appState == STATE_RECORDING)  ? TFT_RED  : TFT_CYAN;
+        drawProgressBar(4, 96, SCREEN_W - 8, 10, prog, barCol);
+    } else {
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        M5.Display.setCursor(4, 90);
+        M5.Display.print("Idle \x7e press HOME then RUN to record");
+    }
+
+    // ── Upload state (y=109..126) ──────────────────────────────────────────
+    M5.Display.fillRect(0, 109, SCREEN_W, 18, TFT_BLACK);
+    M5.Display.drawFastHLine(0, 109, SCREEN_W, 0x2945u);
+    M5.Display.setTextSize(1);
+    const char* utsStr = "IDLE";
+    uint16_t    utsCol = TFT_DARKGREY;
+    switch (uploadTaskState) {
+        case UTS_ENCODING:  utsStr = "ENCODING"; utsCol = TFT_CYAN;   break;
+        case UTS_SD:        utsStr = "SD WRITE"; utsCol = VC_GREEN;   break;
+        case UTS_UPLOADING: utsStr = "POSTING";  utsCol = TFT_CYAN;   break;
+        case UTS_RETRY:     utsStr = "RETRY";    utsCol = TFT_YELLOW; break;
+        case UTS_DONE_OK:   utsStr = "OK";       utsCol = TFT_GREEN;  break;
+        case UTS_DONE_FAIL: utsStr = "FAILED";   utsCol = TFT_RED;    break;
+        default: break;
+    }
+    M5.Display.setTextColor(utsCol, TFT_BLACK);
+    M5.Display.setCursor(4, 115);
+    M5.Display.printf("Upload: %-8s", utsStr);
+    uint16_t httpCol = (lastHttpCode >= 200 && lastHttpCode < 300) ? TFT_GREEN :
+                       (lastHttpCode == 0) ? TFT_DARKGREY : TFT_RED;
+    M5.Display.setTextColor(httpCol, TFT_BLACK);
+    M5.Display.setCursor(140, 115);
+    if (lastHttpCode > 0) M5.Display.printf("HTTP %d", lastHttpCode);
+    else                   M5.Display.print("HTTP --");
+
+    // ── Last UUID (y=127..142) ─────────────────────────────────────────────
+    M5.Display.fillRect(0, 127, SCREEN_W, 16, TFT_BLACK);
+    M5.Display.drawFastHLine(0, 127, SCREEN_W, 0x2945u);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    M5.Display.setCursor(4, 131);
+    String uuidShow = lastVconUUID.length() > 0 ? lastVconUUID : "--";
+    if (uuidShow.length() > 36) uuidShow = uuidShow.substring(uuidShow.length() - 36);
+    M5.Display.print(uuidShow.c_str());
+
+    // ── Counters (y=143..158) ──────────────────────────────────────────────
+    M5.Display.fillRect(0, 143, SCREEN_W, 16, TFT_BLACK);
+    M5.Display.drawFastHLine(0, 143, SCREEN_W, 0x2945u);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_GREEN,  TFT_BLACK);
+    M5.Display.setCursor(4,   147); M5.Display.printf("OK:%u", totalUploads);
+    M5.Display.setTextColor(TFT_RED,    TFT_BLACK);
+    M5.Display.setCursor(80,  147); M5.Display.printf("Err:%u", failedUploads);
+    M5.Display.setTextColor(VC_GREEN,   TFT_BLACK);
+    M5.Display.setCursor(165, 147); M5.Display.printf("Chunk #%u", (uint32_t)continuousChunks);
+
+    // ── Buffer / PSRAM (y=159..174) ────────────────────────────────────────
+    M5.Display.fillRect(0, 159, SCREEN_W, 16, TFT_BLACK);
+    M5.Display.drawFastHLine(0, 159, SCREEN_W, 0x2945u);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.setCursor(4,   163); M5.Display.printf("Buf:%.1fKB", (float)(audioBufferIndex * 2) / 1024.0f);
+    M5.Display.setCursor(130, 163); M5.Display.printf("Free:%uKB", ESP.getFreePsram() / 1024);
+
+    // ── Mode / SD (y=175..193) ─────────────────────────────────────────────
+    M5.Display.fillRect(0, 175, SCREEN_W, 19, TFT_BLACK);
+    M5.Display.drawFastHLine(0, 175, SCREEN_W, 0x2945u);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.setCursor(4, 179);
+    bool contOK = (recordDurationSec <= CONT_MAX_DURATION_SEC);
+    M5.Display.printf("Mode:%s  dur:%us",
+                      contOK ? "CONTINUOUS" : "SINGLE-SHOT",
+                      recordDurationSec);
+    M5.Display.setTextColor(sdReady ? TFT_GREEN : TFT_RED, TFT_BLACK);
+    M5.Display.setCursor(4, 189);
+    M5.Display.printf("SD:%s  saved:%u",
+                      sdReady ? sdCardInfo.c_str() : "none",
+                      sdSaved);
+
+    // ── Button row ─────────────────────────────────────────────────────────
+    drawButtonRow("HOME", "--", "--",
+                  VC_GREEN, TFT_DARKGREY, TFT_DARKGREY);
+}
+
+// =============================================================================
+// UI: Config screen
+// =============================================================================
+
+void drawConfigScreen() {
+    // Header
+    M5.Display.fillRect(0, UI_CONTENT_Y, SCREEN_W, 14, VC_GREEN);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_BLACK, VC_GREEN);
+    M5.Display.setCursor(4, UI_CONTENT_Y + 3);
+    M5.Display.print("CONFIGURATION");
+
+    int y = UI_CONTENT_Y + 16;
+    const int lh = 14;
+    M5.Display.fillRect(0, y, SCREEN_W, UI_CONTENT_H - 16, TFT_BLACK);
 
     auto kv = [&](const char* key, const char* val, uint16_t vc = TFT_WHITE) {
+        M5.Display.setTextSize(1);
         M5.Display.setTextColor(VC_GREEN, TFT_BLACK);
-        M5.Display.setCursor(10, y);
+        M5.Display.setCursor(4, y);
         M5.Display.print(key);
         M5.Display.setTextColor(vc, TFT_BLACK);
-        M5.Display.setCursor(110, y);
+        M5.Display.setCursor(120, y);
         M5.Display.print(val);
         y += lh;
     };
 
-    kv("Device ID:",    deviceID.c_str(), VC_GREEN);
-    kv("MAC Address:",  WiFi.macAddress().c_str(), TFT_CYAN);
-    {
-        char durbuf[24];
-        snprintf(durbuf, sizeof(durbuf), "%u s%s", recordDurationSec,
-                 recordDurationSec > CONT_MAX_DURATION_SEC ? " (single-shot)" : " (continuous)");
-        kv("Rec Duration:", durbuf,
-           recordDurationSec > CONT_MAX_DURATION_SEC ? TFT_YELLOW : TFT_WHITE);
-    }
-    kv("Portal Token:", deviceToken.length() > 0 ? deviceToken.c_str() : "(none)",
-                        deviceToken.length() > 0 ? VC_GREEN : TFT_DARKGREY);
-    kv("WiFi SSID:",    wifiSSID.c_str());
-    kv("WiFi Status:",  wifiConnected ? "CONNECTED" : "DISCONNECTED",
-                        wifiConnected ? TFT_GREEN : TFT_RED);
+    kv("Device ID:",   deviceID.c_str(),          VC_GREEN);
+    kv("MAC:",         WiFi.macAddress().c_str(),  TFT_CYAN);
+    kv("Firmware:",    FIRMWARE_VERSION,            TFT_WHITE);
+
+    char durbuf[24];
+    snprintf(durbuf, sizeof(durbuf), "%us (%s)",
+             recordDurationSec,
+             recordDurationSec <= CONT_MAX_DURATION_SEC ? "cont" : "single");
+    kv("Duration:",    durbuf,  recordDurationSec <= CONT_MAX_DURATION_SEC ? TFT_GREEN : TFT_YELLOW);
+
+    kv("WiFi SSID:",   wifiSSID.c_str(),           TFT_WHITE);
+    kv("WiFi Status:", wifiConnected ? "CONNECTED" : "DISCONNECTED",
+                       wifiConnected ? TFT_GREEN : TFT_RED);
     if (wifiConnected) {
-        kv("IP Address:",  WiFi.localIP().toString().c_str(), TFT_CYAN);
-        kv("RSSI:",        (String(wifiRSSI) + " dBm").c_str());
+        kv("IP:",       WiFi.localIP().toString().c_str(), TFT_CYAN);
+        kv("RSSI:",     (String(wifiRSSI) + " dBm").c_str(), TFT_WHITE);
     }
-    kv("NTP Synced:",  ntpSynced ? "YES" : "NO",  ntpSynced ? TFT_GREEN : TFT_RED);
-    kv("SD Card:",     sdReady ? sdCardInfo.c_str() : "Not ready (format FAT32)",
+    kv("NTP:",         ntpSynced ? "Synced" : "Not synced",
+                       ntpSynced ? TFT_GREEN : TFT_RED);
+
+    String tok = deviceToken.length() > 0 ? deviceToken : "(none)";
+    kv("Token:",       tok.c_str(),
+                       deviceToken.length() > 0 ? VC_GREEN : TFT_DARKGREY);
+
+    kv("SD:",          sdReady ? sdCardInfo.c_str() : "No card",
                        sdReady ? TFT_GREEN : TFT_RED);
-    if (sdReady) {
-        kv("SD Saved:",    (String(sdSaved) + " recordings").c_str());
+
+    // POST URL — word wrap at ~44 chars
+    if (y < UI_CONTENT_Y + UI_CONTENT_H - 14) {
+        M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.setCursor(4, y); M5.Display.print("POST URL:"); y += lh;
+        M5.Display.setTextColor(TFT_MAGENTA, TFT_BLACK);
+        String u = postURL;
+        while (u.length() > 0 && y < UI_CONTENT_Y + UI_CONTENT_H - 2) {
+            int take = min((int)u.length(), 44);
+            M5.Display.setCursor(4, y);
+            M5.Display.print(u.substring(0, take));
+            u = u.substring(take);
+            y += lh;
+        }
     }
-    char tsbuf[32]; getTimestamp(tsbuf, sizeof(tsbuf));
-    kv("Current time:", tsbuf);
-    y += 4;
 
-    M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
-    M5.Display.setCursor(10, y); M5.Display.print("POST URL:"); y += lh;
-    M5.Display.setTextColor(TFT_MAGENTA, TFT_BLACK);
-    // Word-wrap URL at 50 chars
-    String u = postURL;
-    while (u.length() > 0 && y < 170) {
-        M5.Display.setCursor(10, y);
-        String line = u.substring(0, min((int)u.length(), 50));
-        M5.Display.print(line);
-        u = u.substring(line.length());
-        y += lh;
+    // Button row
+    drawButtonRow("HOME", "--", "--",
+                  VC_GREEN, TFT_DARKGREY, TFT_DARKGREY);
+}
+
+// =============================================================================
+// UI: Tools screen
+// =============================================================================
+
+void drawToolsScreen() {
+    const char* itemLabels[TOOL_COUNT] = {
+        "Test WiFi",
+        "Test OTA",
+        "Test POST",
+        "Show SD",
+        "Restart"
+    };
+
+    // Header
+    M5.Display.fillRect(0, UI_CONTENT_Y, SCREEN_W, 14, VC_GREEN);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_BLACK, VC_GREEN);
+    M5.Display.setCursor(4, UI_CONTENT_Y + 3);
+    M5.Display.print("TOOLS \x7e DIAGNOSTICS");
+
+    M5.Display.fillRect(0, UI_CONTENT_Y + 14, SCREEN_W, UI_CONTENT_H - 14, TFT_BLACK);
+
+    if (toolsPhase == TPHASE_SELECT) {
+        // Menu items (y=22..186, 5 items × 32px each)
+        for (int i = 0; i < TOOL_COUNT; i++) {
+            int iy = UI_CONTENT_Y + 14 + i * 33;
+            bool sel = (i == (int)toolsSelectedItem);
+            uint16_t bg = sel ? 0x1082u : TFT_BLACK;   // dark highlight
+            M5.Display.fillRect(0, iy, SCREEN_W, 32, bg);
+            if (sel) {
+                M5.Display.fillRect(0, iy, 4, 32, VC_GREEN);  // left accent bar
+                M5.Display.drawRect(0, iy, SCREEN_W, 32, VC_GREEN);
+            }
+            M5.Display.setTextSize(2);
+            M5.Display.setTextColor(sel ? VC_GREEN : TFT_WHITE, bg);
+            M5.Display.setCursor(12, iy + 8);
+            M5.Display.print(itemLabels[i]);
+            // Danger label for restart
+            if (i == TOOL_RESTART) {
+                M5.Display.setTextSize(1);
+                M5.Display.setTextColor(TFT_RED, bg);
+                M5.Display.setCursor(200, iy + 12);
+                M5.Display.print("REBOOT");
+            }
+        }
+        drawButtonRow("PREV", "RUN", "HOME",
+                      VC_GREEN, TFT_GREEN, VC_GREEN);
+
+    } else if (toolsPhase == TPHASE_CONFIRM) {
+        M5.Display.setTextSize(2);
+        M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+        M5.Display.setCursor(60, 80);
+        M5.Display.print("Restart device?");
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.setCursor(40, 110);
+        M5.Display.print("This will reboot the M5Stack.");
+        M5.Display.setCursor(40, 124);
+        M5.Display.print("Any active recording will stop.");
+        drawButtonRow("--", "CONFIRM", "CANCEL",
+                      TFT_DARKGREY, TFT_RED, VC_GREEN);
+
+    } else if (toolsPhase == TPHASE_RUNNING) {
+        const char* itemLabels2[TOOL_COUNT] = {
+            "Testing WiFi...", "Testing OTA...", "Testing POST...",
+            "Reading SD...", "Restarting..."
+        };
+        M5.Display.setTextSize(2);
+        M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+        M5.Display.setCursor(20, 80);
+        M5.Display.print(itemLabels2[toolsSelectedItem]);
+        // Animated dots
+        int dots = (millis() / 400) % 4;
+        M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.setCursor(20, 110);
+        for (int d = 0; d < dots; d++) M5.Display.print(". ");
+        drawButtonRow("--", "--", "--",
+                      TFT_DARKGREY, TFT_DARKGREY, TFT_DARKGREY);
+
+    } else {  // TPHASE_RESULT
+        M5.Display.setTextSize(2);
+        uint16_t resCol = toolsResultOK ? TFT_GREEN : TFT_RED;
+        M5.Display.setTextColor(resCol, TFT_BLACK);
+        M5.Display.setCursor(20, 40);
+        M5.Display.print(toolsResultOK ? "PASS" : "FAIL");
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.setCursor(20, 70); M5.Display.print(toolsResultLine1.c_str());
+        M5.Display.setCursor(20, 86); M5.Display.print(toolsResultLine2.c_str());
+        // Time remaining auto-clear bar
+        unsigned long elapsed = millis() - toolsResultMs;
+        float remaining = 1.0f - min(1.0f, (float)elapsed / (float)TOOLS_RESULT_TIMEOUT_MS);
+        drawProgressBar(20, 110, SCREEN_W - 40, 6, remaining, TFT_DARKGREY);
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        M5.Display.setCursor(20, 122);
+        M5.Display.print("Auto-returns to menu...");
+        drawButtonRow("--", "BACK", "HOME",
+                      TFT_DARKGREY, VC_GREEN, VC_GREEN);
     }
-    y += 4;
+}
 
-    M5.Display.setTextColor(VC_GREEN, TFT_BLACK);
-    M5.Display.setCursor(10, y); M5.Display.print("Serial commands (115200):"); y += lh;
-    M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    M5.Display.setCursor(10, y); M5.Display.print("wifi <ssid> <password>");  y += lh;
-    M5.Display.setCursor(10, y); M5.Display.print("url  <post_url>");          y += lh;
-    M5.Display.setCursor(10, y); M5.Display.print("dur  <10-120>");            y += lh;
-    M5.Display.setCursor(10, y); M5.Display.print("status | restart | help");
+// =============================================================================
+// UI: Full UI redraw dispatcher
+// =============================================================================
 
-    // Footer
-    M5.Display.fillRect(0, SCREEN_H - 20, SCREEN_W, 20, TFT_DARKGREY);
-    M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
-    M5.Display.setCursor(90, SCREEN_H - 14);
-    M5.Display.print("Press any button to go back");
-
-    // Wait for button press
-    while (true) {
-        M5.update();
-        if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnC.wasPressed()) break;
-        delay(50);
+void updateDisplay() {
+    M5.Display.startWrite();
+    drawHazard(0, 0, SCREEN_W, UI_TOP_H);
+    switch (currentScreen) {
+        case SCREEN_HOME:   drawHomeScreen();   break;
+        case SCREEN_STATUS: drawStatusScreen(); break;
+        case SCREEN_CONFIG: drawConfigScreen(); break;
+        case SCREEN_TOOLS:  drawToolsScreen();  break;
     }
-    // Full redraw on return
-    updateDisplay();
+    M5.Display.endWrite();
+}
+
+// =============================================================================
+// Tools: individual tool implementations
+// =============================================================================
+
+void toolsRunWifiTest() {
+    connectWiFi();
+    if (wifiConnected) {
+        toolsResultOK    = true;
+        toolsResultLine1 = "Connected: " + wifiSSID;
+        toolsResultLine2 = "IP: " + WiFi.localIP().toString() +
+                           "  RSSI: " + String(wifiRSSI) + " dBm";
+    } else {
+        toolsResultOK    = false;
+        toolsResultLine1 = "FAILED \x7e check credentials";
+        toolsResultLine2 = "Use: wifi <ssid> <password>";
+    }
+}
+
+void toolsRunOtaTest() {
+    if (!wifiConnected) {
+        toolsResultOK    = false;
+        toolsResultLine1 = "No WiFi \x7e connect first";
+        toolsResultLine2 = "";
+        return;
+    }
+    HTTPClient http;
+    http.setTimeout(10000);
+    http.begin(OTA_VERSION_URL);
+    int code = http.GET();
+    if (code == 200) {
+        String remote = http.getString();
+        remote.trim();
+        http.end();
+        toolsResultOK    = true;
+        toolsResultLine1 = "Local: " FIRMWARE_VERSION "  Remote: " + remote;
+        toolsResultLine2 = (remote == FIRMWARE_VERSION) ? "Firmware is current"
+                                                        : "Update available!";
+    } else {
+        http.end();
+        toolsResultOK    = false;
+        toolsResultLine1 = "HTTP " + String(code);
+        toolsResultLine2 = OTA_VERSION_URL;
+    }
+}
+
+void toolsRunPostTest() {
+    if (!wifiConnected) {
+        toolsResultOK    = false;
+        toolsResultLine1 = "No WiFi \x7e connect first";
+        toolsResultLine2 = "";
+        return;
+    }
+    const size_t SILENCE_SAMPLES = (size_t)SAMPLE_RATE;   // 1 second
+    int16_t* silenceBuf = (int16_t*)ps_malloc(SILENCE_SAMPLES * 2u);
+    if (!silenceBuf) {
+        toolsResultOK    = false;
+        toolsResultLine1 = "PSRAM alloc failed";
+        toolsResultLine2 = String(ESP.getFreePsram()) + " bytes free";
+        return;
+    }
+    memset(silenceBuf, 0, SILENCE_SAMPLES * 2u);
+    bool ok = buildAndUploadVConCore(silenceBuf, SILENCE_SAMPLES);
+    free(silenceBuf);
+    toolsResultOK    = ok;
+    toolsResultLine1 = ok ? "POST succeeded" : "POST failed";
+    String uuidShort = lastVconUUID.length() >= 8
+                       ? lastVconUUID.substring(lastVconUUID.length() - 8) : "--";
+    toolsResultLine2 = "HTTP " + String((int)uploadTaskHttpCode) +
+                       "  uuid: ..." + uuidShort;
+    lastHttpCode = (int)uploadTaskHttpCode;
+}
+
+void toolsShowSD() {
+    if (!sdReady) {
+        toolsResultOK    = false;
+        toolsResultLine1 = "No SD card detected";
+        toolsResultLine2 = "Format FAT32, reinsert, restart";
+        return;
+    }
+    uint64_t totalMB = SD.totalBytes() / (1024ULL * 1024ULL);
+    uint64_t usedMB  = SD.usedBytes()  / (1024ULL * 1024ULL);
+    uint64_t freeMB  = totalMB - usedMB;
+    toolsResultOK    = true;
+    toolsResultLine1 = String((uint32_t)totalMB) + "MB total  " +
+                       String((uint32_t)usedMB)  + "MB used";
+    toolsResultLine2 = String((uint32_t)freeMB)  + "MB free  saved:" +
+                       String(sdSaved);
+}
+
+void toolsRunSelected() {
+    switch ((ToolsItem)toolsSelectedItem) {
+        case TOOL_WIFI_TEST: toolsRunWifiTest(); break;
+        case TOOL_OTA_TEST:  toolsRunOtaTest();  break;
+        case TOOL_POST_TEST: toolsRunPostTest(); break;
+        case TOOL_SD_SHOW:   toolsShowSD();      break;
+        default: break;
+    }
+    toolsPhase    = TPHASE_RESULT;
+    toolsResultMs = millis();
+}
+
+// =============================================================================
+// Button handling
+// =============================================================================
+
+void handleToolsButtons() {
+    switch (toolsPhase) {
+    case TPHASE_SELECT:
+        if (M5.BtnA.wasPressed()) {
+            toolsSelectedItem = (toolsSelectedItem + TOOL_COUNT - 1) % TOOL_COUNT;
+        }
+        if (M5.BtnB.wasPressed()) {
+            if (appState == STATE_RECORDING || appState == STATE_CONTINUOUS) {
+                toolsResultOK    = false;
+                toolsResultLine1 = "Stop recording first";
+                toolsResultLine2 = "Press HOME STOP then return";
+                toolsPhase    = TPHASE_RESULT;
+                toolsResultMs = millis();
+            } else if (toolsSelectedItem == TOOL_RESTART) {
+                toolsPhase = TPHASE_CONFIRM;
+            } else {
+                toolsPhase = TPHASE_RUNNING;
+                // toolsRunSelected() is called from loop() on next iteration
+            }
+        }
+        if (M5.BtnC.wasPressed()) {
+            currentScreen = SCREEN_HOME;
+        }
+        break;
+
+    case TPHASE_CONFIRM:
+        if (M5.BtnB.wasPressed()) {
+            Serial.println("[tools] User-initiated restart");
+            delay(200);
+            ESP.restart();
+        }
+        if (M5.BtnC.wasPressed()) {
+            toolsPhase    = TPHASE_SELECT;
+            currentScreen = SCREEN_HOME;
+        }
+        break;
+
+    case TPHASE_RUNNING:
+        // no input while running
+        break;
+
+    case TPHASE_RESULT:
+        if (M5.BtnB.wasPressed()) toolsPhase = TPHASE_SELECT;
+        if (M5.BtnC.wasPressed()) {
+            toolsPhase    = TPHASE_SELECT;
+            currentScreen = SCREEN_HOME;
+        }
+        if ((millis() - toolsResultMs) > TOOLS_RESULT_TIMEOUT_MS) {
+            toolsPhase = TPHASE_SELECT;
+        }
+        break;
+    }
+}
+
+void handleButtons() {
+    bool anyPressed = M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnC.wasPressed();
+    if (anyPressed) lastButtonMs = millis();
+
+    // Inactivity auto-return to HOME
+    if (currentScreen != SCREEN_HOME &&
+        (millis() - lastButtonMs) > INACTIVITY_TIMEOUT_MS) {
+        currentScreen = SCREEN_HOME;
+        return;
+    }
+
+    bool idle   = (appState == STATE_IDLE    ||
+                   appState == STATE_SUCCESS ||
+                   appState == STATE_ERROR);
+    bool activeRec = (appState == STATE_RECORDING || appState == STATE_CONTINUOUS);
+
+    switch (currentScreen) {
+
+    case SCREEN_HOME:
+        if (idle) {
+            if (M5.BtnA.wasPressed()) {
+                // RUN — same logic as old BtnA handler
+                checkWiFi();
+                if (!audioBuffer && !allocateAudioBuffer()) {
+                    lastStatus    = "PSRAM alloc failed!";
+                    appState      = STATE_ERROR;
+                    stateChangeMs = millis();
+                } else if (recordDurationSec > CONT_MAX_DURATION_SEC) {
+                    Serial.printf("[audio] Duration %u s > %u s — single-shot\n",
+                                  recordDurationSec, CONT_MAX_DURATION_SEC);
+                    continuousMode = false;
+                    stopContinuous = false;
+                    startRecording();
+                } else if (!allocateContinuousBuffers()) {
+                    lastStatus    = "PSRAM bufB alloc fail";
+                    appState      = STATE_ERROR;
+                    stateChangeMs = millis();
+                } else {
+                    continuousMode   = true;
+                    stopContinuous   = false;
+                    continuousChunks = 0;
+                    recordBuf        = audioBufA;
+                    startRecording();
+                }
+            }
+            if (M5.BtnB.wasPressed()) currentScreen = SCREEN_CONFIG;
+            if (M5.BtnC.wasPressed()) currentScreen = SCREEN_TOOLS;
+        } else if (activeRec) {
+            if (M5.BtnB.wasPressed()) {
+                // STOP — same logic as old BtnB handler
+                if (appState == STATE_CONTINUOUS) {
+                    stopContinuous = true;
+                    lastStatus = "Stopping after this chunk...";
+                } else if (appState == STATE_RECORDING) {
+                    M5.Mic.end();
+                    isRecording = false;
+                    if (audioBufferIndex > 0) {
+                        appState   = STATE_ENCODING;
+                        lastStatus = "Stopped early \x7e encoding...";
+                    } else {
+                        appState   = STATE_IDLE;
+                        lastStatus = "Recording cancelled";
+                    }
+                }
+            }
+            if (M5.BtnC.wasPressed()) currentScreen = SCREEN_STATUS;
+        } else {
+            // ENCODING / UPLOADING
+            if (M5.BtnC.wasPressed()) currentScreen = SCREEN_STATUS;
+        }
+        break;
+
+    case SCREEN_STATUS:
+        if (M5.BtnA.wasPressed()) currentScreen = SCREEN_HOME;
+        break;
+
+    case SCREEN_CONFIG:
+        if (M5.BtnA.wasPressed()) currentScreen = SCREEN_HOME;
+        break;
+
+    case SCREEN_TOOLS:
+        handleToolsButtons();
+        break;
+    }
 }
 
 // =============================================================================
@@ -1815,9 +2230,6 @@ void setup() {
     M5.Display.setCursor(40, 120);
     M5.Display.print("Initializing...");
 
-    // ---- Audio sprite (160×87 off-screen buffer for the VU meter panel) ----
-    audioSprite.createSprite(160, 87);
-
     // PSRAM check — Core2 requires it for the 960 KB audio buffer
     if (!psramFound()) {
         M5.Display.fillScreen(TFT_RED);
@@ -1873,6 +2285,7 @@ void setup() {
     initNTP();
 
     updateDisplay();
+    lastButtonMs = millis();
 
     Serial.println("[init] Ready. Press BtnA to record.");
 }
@@ -1915,68 +2328,13 @@ void loop() {
         buildAndUploadVCon();
     }
 
-    // ---- Button handling -----------------------------------------------
-    // A = RUN    — start continuous record+post loop (only when idle/done)
-    // B = STOP   — signal stop; finishes current chunk before halting
-    // C = CONFIG — show configuration screen (only when idle/done)
-
-    if (M5.BtnA.wasPressed()) {
-        if (appState == STATE_IDLE ||
-            appState == STATE_SUCCESS ||
-            appState == STATE_ERROR) {
-            checkWiFi();
-            // Reallocate buffer A if it was freed by a 'dur' change
-            if (!audioBuffer && !allocateAudioBuffer()) {
-                lastStatus    = "PSRAM alloc failed!";
-                appState      = STATE_ERROR;
-                stateChangeMs = millis();
-            } else if (recordDurationSec > CONT_MAX_DURATION_SEC) {
-                // Duration too long for dual-buffer — run single-shot instead
-                Serial.printf("[audio] Duration %u s > %u s limit — single-shot mode\n",
-                              recordDurationSec, CONT_MAX_DURATION_SEC);
-                continuousMode = false;
-                stopContinuous = false;
-                startRecording();   // sets appState = STATE_RECORDING
-            } else if (!allocateContinuousBuffers()) {
-                lastStatus    = "PSRAM bufB alloc fail";
-                appState      = STATE_ERROR;
-                stateChangeMs = millis();
-            } else {
-                continuousMode   = true;
-                stopContinuous   = false;
-                continuousChunks = 0;
-                recordBuf        = audioBufA;
-                startRecording();   // sets appState = STATE_CONTINUOUS
-            }
-        }
+    // ---- TOOLS execution — run selected tool when phase is RUNNING ----------
+    if (currentScreen == SCREEN_TOOLS && toolsPhase == TPHASE_RUNNING) {
+        toolsRunSelected();
     }
 
-    if (M5.BtnB.wasPressed()) {
-        if (appState == STATE_CONTINUOUS) {
-            // Signal the loop to stop after this chunk completes
-            stopContinuous = true;
-            lastStatus = "Stopping after this chunk...";
-        } else if (appState == STATE_RECORDING) {
-            // Single-shot mode early stop
-            M5.Mic.end();
-            isRecording = false;
-            if (audioBufferIndex > 0) {
-                appState   = STATE_ENCODING;
-                lastStatus = "Stopped early — encoding...";
-            } else {
-                appState   = STATE_IDLE;
-                lastStatus = "Recording cancelled";
-            }
-        }
-    }
-
-    if (M5.BtnC.wasPressed()) {
-        if (appState == STATE_IDLE ||
-            appState == STATE_SUCCESS ||
-            appState == STATE_ERROR) {
-            showConfig();
-        }
-    }
+    // ---- Button handling ------------------------------------------------
+    handleButtons();
 
     // ---- Auto-return from SUCCESS/ERROR after 8 seconds ----------------
     if ((appState == STATE_SUCCESS || appState == STATE_ERROR) &&
