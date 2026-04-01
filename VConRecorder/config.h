@@ -23,11 +23,11 @@
 
 // Firmware version — must match /public/version.txt on the OTA server
 // when this build is the current release.
-#define FIRMWARE_VERSION      "1.0.1"
+#define FIRMWARE_VERSION      "1.0.2"
 
 // OTA endpoints — served as static files from the same Replit host
-#define OTA_VERSION_URL       "https://vcon-gateway.replit.app/version.txt"
-#define OTA_FIRMWARE_URL      "https://vcon-gateway.replit.app/firmware.bin"
+#define OTA_VERSION_URL       "https://vcon-gateway.replit.app/api/ota/version.txt"
+#define OTA_FIRMWARE_URL      "https://vcon-gateway.replit.app/api/ota/firmware.bin"
 
 // VConic portal device token (optional).
 // When set, appended as ?token=<value> and sent as X-Device-Token header.
