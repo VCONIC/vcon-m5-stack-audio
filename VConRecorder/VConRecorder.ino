@@ -60,6 +60,7 @@ enum AppState {
 // Config
 Preferences prefs;
 String wifiSSID, wifiPassword, postURL, deviceToken;
+uint32_t recordDurationSec = RECORD_DURATION_SEC;  // runtime-settable via 'dur' command
 
 // Device unique identifier — "VC-XXXXXX" derived from last 3 MAC bytes.
 // Set once in setup(), before the splash screen.
@@ -148,20 +149,39 @@ String   sdCardInfo = "No card";
 M5Canvas audioSprite(&M5.Display);
 
 // =============================================================================
+// Runtime audio-size helpers
+// =============================================================================
+// Buffer allocation and fill limits are based on the current recordDurationSec,
+// which is set at runtime and persisted to flash.  All code uses these helpers
+// instead of compile-time constants so they pick up the live value.
+
+inline uint32_t audioSampleTarget() {
+    return recordDurationSec * (uint32_t)SAMPLE_RATE;
+}
+inline uint32_t audioPcmBytes() {
+    return audioSampleTarget() * 2u;
+}
+
+// =============================================================================
 // Configuration (Preferences / flash)
 // =============================================================================
 
 void loadConfig() {
     prefs.begin("vconrec", false);
-    wifiSSID      = prefs.getString("wifi_ssid",  DEFAULT_WIFI_SSID);
-    wifiPassword  = prefs.getString("wifi_pass",  DEFAULT_WIFI_PASSWORD);
-    postURL       = prefs.getString("post_url",   DEFAULT_POST_URL);
-    deviceToken   = prefs.getString("dev_token",  DEFAULT_DEVICE_TOKEN);
-    totalUploads  = prefs.getUInt("total_up", 0);
-    failedUploads = prefs.getUInt("fail_up",  0);
+    wifiSSID          = prefs.getString("wifi_ssid",  DEFAULT_WIFI_SSID);
+    wifiPassword      = prefs.getString("wifi_pass",  DEFAULT_WIFI_PASSWORD);
+    postURL           = prefs.getString("post_url",   DEFAULT_POST_URL);
+    deviceToken       = prefs.getString("dev_token",  DEFAULT_DEVICE_TOKEN);
+    totalUploads      = prefs.getUInt("total_up", 0);
+    failedUploads     = prefs.getUInt("fail_up",  0);
+    recordDurationSec = prefs.getUInt("rec_dur",  RECORD_DURATION_SEC);
     prefs.end();
+    // Clamp in case a previously stored value is out of range
+    if (recordDurationSec < MIN_RECORD_DURATION_SEC) recordDurationSec = MIN_RECORD_DURATION_SEC;
+    if (recordDurationSec > MAX_RECORD_DURATION_SEC) recordDurationSec = MAX_RECORD_DURATION_SEC;
     Serial.printf("[config] SSID=%s\n[config] URL=%s\n",
                   wifiSSID.c_str(), postURL.c_str());
+    Serial.printf("[config] Duration=%u s\n", recordDurationSec);
     if (deviceToken.length() > 0)
         Serial.printf("[config] Token=%s\n", deviceToken.c_str());
 }
@@ -174,6 +194,7 @@ void saveConfig() {
     prefs.putString("dev_token", deviceToken);
     prefs.putUInt("total_up",  totalUploads);
     prefs.putUInt("fail_up",   failedUploads);
+    prefs.putUInt("rec_dur",   recordDurationSec);
     prefs.end();
 }
 
@@ -557,38 +578,51 @@ void generateUUID(char* out) {
 // Audio Recording
 // =============================================================================
 
+// Free both audio buffers so they can be reallocated at a new size.
+// Call only when not recording.
+void freeAudioBuffers() {
+    if (audioBufA) { free(audioBufA); audioBufA = nullptr; }
+    if (audioBufB) { free(audioBufB); audioBufB = nullptr; }
+    audioBuffer = nullptr;
+    recordBuf   = nullptr;
+}
+
 bool allocateAudioBuffer() {
-    if (audioBuffer) { free(audioBuffer); audioBuffer = nullptr; audioBufA = nullptr; }
+    // Free any existing buffer — size may have changed via 'dur' command
+    if (audioBufA) { free(audioBufA); audioBufA = nullptr; audioBuffer = nullptr; }
     if (!psramFound()) {
         Serial.println("[audio] FATAL: No PSRAM. Core2 requires PSRAM for audio buffer.");
         lastStatus = "No PSRAM detected!";
         return false;
     }
-    audioBuffer = (int16_t*)ps_malloc(AUDIO_PCM_BYTES);
+    uint32_t sz = audioPcmBytes();
+    audioBuffer = (int16_t*)ps_malloc(sz);
     if (!audioBuffer) {
         Serial.printf("[audio] ps_malloc(%u) failed. Free PSRAM: %u\n",
-                      AUDIO_PCM_BYTES, ESP.getFreePsram());
+                      sz, ESP.getFreePsram());
         lastStatus = "PSRAM alloc failed!";
         return false;
     }
     audioBufA = audioBuffer;   // audioBufA is always the first (primary) buffer
     recordBuf = audioBufA;
-    Serial.printf("[audio] PCM buffer A: %u bytes. Free PSRAM: %u\n",
-                  AUDIO_PCM_BYTES, ESP.getFreePsram());
+    Serial.printf("[audio] PCM buffer A: %u bytes (%u s). Free PSRAM: %u\n",
+                  sz, recordDurationSec, ESP.getFreePsram());
     return true;
 }
 
 // Allocate the second PSRAM buffer needed for continuous double-buffering.
 bool allocateContinuousBuffers() {
-    if (audioBufB) return true;   // already allocated
-    audioBufB = (int16_t*)ps_malloc(AUDIO_PCM_BYTES);
+    // If already allocated at the right size, reuse it
+    if (audioBufB) return true;
+    uint32_t sz = audioPcmBytes();
+    audioBufB = (int16_t*)ps_malloc(sz);
     if (!audioBufB) {
         Serial.printf("[audio] ps_malloc buf B (%u) failed. Free PSRAM: %u\n",
-                      AUDIO_PCM_BYTES, ESP.getFreePsram());
+                      sz, ESP.getFreePsram());
         return false;
     }
-    Serial.printf("[audio] PCM buffer B: %u bytes. Free PSRAM: %u\n",
-                  AUDIO_PCM_BYTES, ESP.getFreePsram());
+    Serial.printf("[audio] PCM buffer B: %u bytes (%u s). Free PSRAM: %u\n",
+                  sz, recordDurationSec, ESP.getFreePsram());
     return true;
 }
 
@@ -599,7 +633,7 @@ void startRecording() {
     int16_t* buf = continuousMode ? recordBuf : audioBufA;
     if (!buf) buf = audioBuffer;   // safety fallback
 
-    memset(buf, 0, AUDIO_PCM_BYTES);
+    memset(buf, 0, audioPcmBytes());
     audioBuffer      = buf;   // recordAudioChunk() reads this global
     audioBufferIndex = 0;
 
@@ -618,13 +652,13 @@ void startRecording() {
     appState      = continuousMode ? STATE_CONTINUOUS : STATE_RECORDING;
     lastStatus    = continuousMode
                     ? "Continuous: chunk 1..."
-                    : "Recording " + String(RECORD_DURATION_SEC) + " s...";
+                    : "Recording " + String(recordDurationSec) + " s...";
 
     memset(levelHistory, 0, sizeof(levelHistory));
     levelIdx = 0;
 
-    Serial.printf("[audio] Recording started (continuous=%d). Target: %d s\n",
-                  (int)continuousMode, RECORD_DURATION_SEC);
+    Serial.printf("[audio] Recording started (continuous=%d). Target: %u s\n",
+                  (int)continuousMode, recordDurationSec);
 }
 
 // Call from loop() while STATE_RECORDING or STATE_CONTINUOUS.
@@ -632,7 +666,7 @@ void startRecording() {
 void recordAudioChunk() {
     if (!isRecording) return;
 
-    size_t remaining = AUDIO_SAMPLES - audioBufferIndex;
+    size_t remaining = audioSampleTarget() - audioBufferIndex;
     if (remaining == 0) {
         if (continuousMode) {
             // Don't stop — swapAndContinue() in loop() will handle the swap.
@@ -677,7 +711,7 @@ void recordAudioChunk() {
     }
 
     // Check elapsed time
-    if (millis() - recordStartMs >= (unsigned long)RECORD_DURATION_SEC * 1000UL) {
+    if (millis() - recordStartMs >= (unsigned long)recordDurationSec * 1000UL) {
         if (!continuousMode) {
             M5.Mic.end();
             isRecording = false;
@@ -691,7 +725,7 @@ void recordAudioChunk() {
 
 float recordingProgress() {
     unsigned long elapsed = millis() - recordStartMs;
-    return min(1.0f, (float)elapsed / ((float)RECORD_DURATION_SEC * 1000.0f));
+    return min(1.0f, (float)elapsed / ((float)recordDurationSec * 1000.0f));
 }
 
 // =============================================================================
@@ -1049,8 +1083,8 @@ void startUploadTask(int16_t* buf, size_t numSamples) {
 // Called every loop() tick in continuous mode.
 void swapAndContinue() {
     bool durationDone = (millis() - recordStartMs >=
-                         (unsigned long)RECORD_DURATION_SEC * 1000UL);
-    bool bufferFull   = (audioBufferIndex >= AUDIO_SAMPLES);
+                         (unsigned long)recordDurationSec * 1000UL);
+    bool bufferFull   = (audioBufferIndex >= audioSampleTarget());
 
     if (!(durationDone || bufferFull)) return;
 
@@ -1071,7 +1105,7 @@ void swapAndContinue() {
 
     recordBuf        = (recordBuf == audioBufA) ? audioBufB : audioBufA;
     audioBuffer      = recordBuf;
-    memset(audioBuffer, 0, AUDIO_PCM_BYTES);
+    memset(audioBuffer, 0, audioPcmBytes());
     audioBufferIndex = 0;
     recordStartMs    = millis();
 
@@ -1272,9 +1306,9 @@ void updateDisplay() {
     if (activeRec) {
         unsigned long elapsed = (millis() - recordStartMs) / 1000;
         char timerbuf[16];
-        snprintf(timerbuf, sizeof(timerbuf), "%02lu:%02lu/%02d:%02d",
+        snprintf(timerbuf, sizeof(timerbuf), "%02lu:%02lu/%02u:%02u",
                  elapsed / 60, elapsed % 60,
-                 RECORD_DURATION_SEC / 60, RECORD_DURATION_SEC % 60);
+                 recordDurationSec / 60, recordDurationSec % 60);
         M5.Display.setTextColor(TFT_RED, TFT_BLACK);
         M5.Display.setCursor(3, 82);
         M5.Display.print(appState == STATE_CONTINUOUS ? "* CONT" : "* REC");
@@ -1491,6 +1525,13 @@ void showConfig() {
 
     kv("Device ID:",    deviceID.c_str(), VC_GREEN);
     kv("MAC Address:",  WiFi.macAddress().c_str(), TFT_CYAN);
+    {
+        char durbuf[24];
+        snprintf(durbuf, sizeof(durbuf), "%u s%s", recordDurationSec,
+                 recordDurationSec > CONT_MAX_DURATION_SEC ? " (single-shot)" : " (continuous)");
+        kv("Rec Duration:", durbuf,
+           recordDurationSec > CONT_MAX_DURATION_SEC ? TFT_YELLOW : TFT_WHITE);
+    }
     kv("Portal Token:", deviceToken.length() > 0 ? deviceToken.c_str() : "(none)",
                         deviceToken.length() > 0 ? VC_GREEN : TFT_DARKGREY);
     kv("WiFi SSID:",    wifiSSID.c_str());
@@ -1529,6 +1570,7 @@ void showConfig() {
     M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
     M5.Display.setCursor(10, y); M5.Display.print("wifi <ssid> <password>");  y += lh;
     M5.Display.setCursor(10, y); M5.Display.print("url  <post_url>");          y += lh;
+    M5.Display.setCursor(10, y); M5.Display.print("dur  <10-120>");            y += lh;
     M5.Display.setCursor(10, y); M5.Display.print("status | restart | help");
 
     // Footer
@@ -1584,11 +1626,48 @@ void handleSerialCommand(const String& cmd) {
         deviceToken = "";
         saveConfig();
         Serial.println("[cmd] Device token cleared — will use MAC routing");
+    } else if (cmd.startsWith("dur ") || cmd == "dur") {
+        if (cmd == "dur") {
+            // 'dur' with no argument prints current value
+            Serial.printf("[cmd] Recording duration: %u s (%s mode)\n",
+                          recordDurationSec,
+                          recordDurationSec <= CONT_MAX_DURATION_SEC ? "continuous" : "single-shot");
+        } else {
+            // Reject change while recording
+            if (appState == STATE_RECORDING || appState == STATE_CONTINUOUS ||
+                appState == STATE_ENCODING  || appState == STATE_UPLOADING) {
+                Serial.println("[cmd] Cannot change duration while recording — stop first");
+            } else {
+                uint32_t newDur = (uint32_t)cmd.substring(4).toInt();
+                if (newDur < MIN_RECORD_DURATION_SEC) {
+                    Serial.printf("[cmd] Minimum duration is %u s\n", MIN_RECORD_DURATION_SEC);
+                } else if (newDur > MAX_RECORD_DURATION_SEC) {
+                    Serial.printf("[cmd] Maximum duration is %u s\n", MAX_RECORD_DURATION_SEC);
+                } else {
+                    recordDurationSec = newDur;
+                    saveConfig();
+                    // Free existing buffers — they'll be reallocated at the new size on next RUN
+                    freeAudioBuffers();
+                    Serial.printf("[cmd] Duration set to %u s", recordDurationSec);
+                    if (recordDurationSec > CONT_MAX_DURATION_SEC) {
+                        Serial.printf(" (> %u s — continuous mode disabled, using single-shot)\n",
+                                      CONT_MAX_DURATION_SEC);
+                    } else {
+                        Serial.println(" (continuous mode available)");
+                    }
+                    Serial.println("[cmd] Buffers freed — will reallocate on next RUN press");
+                }
+            }
+        }
     } else if (cmd == "status") {
         Serial.println("\n=== vCon Recorder Status ===");
         Serial.printf("Firmware:    %s\n", FIRMWARE_VERSION);
         Serial.printf("Device ID:   %s\n", deviceID.c_str());
         Serial.printf("MAC Address: %s\n", WiFi.macAddress().c_str());
+        Serial.printf("Rec Duration:%u s (%s mode, range %u-%u s)\n",
+                      recordDurationSec,
+                      recordDurationSec <= CONT_MAX_DURATION_SEC ? "continuous" : "single-shot",
+                      MIN_RECORD_DURATION_SEC, MAX_RECORD_DURATION_SEC);
         Serial.printf("Device Token:%s\n",
                       deviceToken.length() > 0 ? deviceToken.c_str() : "(none — using MAC routing)");
         Serial.printf("WiFi SSID:   %s\n", wifiSSID.c_str());
@@ -1640,6 +1719,9 @@ void handleSerialCommand(const String& cmd) {
         Serial.println("url   <post_url>          Set vCon POST URL");
         Serial.println("token <dvt_xxx>           Set portal device token (token routing)");
         Serial.println("token                     Clear token (use MAC routing)");
+        Serial.printf( "dur   <10-%u>           Set recording duration in seconds\n",
+                       MAX_RECORD_DURATION_SEC);
+        Serial.println("dur                       Show current recording duration");
         Serial.println("status                    Show current config");
         Serial.println("sd                        Show SD card status");
         Serial.println("restart                   Reboot device");
@@ -1843,15 +1925,27 @@ void loop() {
             appState == STATE_SUCCESS ||
             appState == STATE_ERROR) {
             checkWiFi();
-            if (!allocateContinuousBuffers()) {
-                lastStatus = "PSRAM bufB alloc fail";
-                appState   = STATE_ERROR;
+            // Reallocate buffer A if it was freed by a 'dur' change
+            if (!audioBuffer && !allocateAudioBuffer()) {
+                lastStatus    = "PSRAM alloc failed!";
+                appState      = STATE_ERROR;
+                stateChangeMs = millis();
+            } else if (recordDurationSec > CONT_MAX_DURATION_SEC) {
+                // Duration too long for dual-buffer — run single-shot instead
+                Serial.printf("[audio] Duration %u s > %u s limit — single-shot mode\n",
+                              recordDurationSec, CONT_MAX_DURATION_SEC);
+                continuousMode = false;
+                stopContinuous = false;
+                startRecording();   // sets appState = STATE_RECORDING
+            } else if (!allocateContinuousBuffers()) {
+                lastStatus    = "PSRAM bufB alloc fail";
+                appState      = STATE_ERROR;
                 stateChangeMs = millis();
             } else {
-                continuousMode = true;
-                stopContinuous = false;
+                continuousMode   = true;
+                stopContinuous   = false;
                 continuousChunks = 0;
-                recordBuf = audioBufA;
+                recordBuf        = audioBufA;
                 startRecording();   // sets appState = STATE_CONTINUOUS
             }
         }

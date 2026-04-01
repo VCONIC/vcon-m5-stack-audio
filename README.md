@@ -225,6 +225,33 @@ are submitted as unassigned (HTTP 200) and can be claimed in the portal.
 
 ---
 
+### `dur <seconds>`
+Set the recording chunk length. Valid range: **10–120 seconds**.
+
+```
+dur 60     # 1 minute per chunk (default)
+dur 30     # 30 seconds
+dur 120    # 2 minutes (single-shot only)
+```
+
+- **10–60 s** → continuous dual-buffer mode available (recording continues
+  without gaps while the previous chunk uploads in parallel on core 0).
+- **61–120 s** → single-shot mode only; the device records one chunk, encodes
+  and uploads it, then waits for the next RUN press. This is automatic — no
+  extra configuration needed.
+
+The new duration takes effect on the next RUN press. Buffers are reallocated
+at the new size; the old buffers are freed immediately.
+
+Setting is stored in flash and survives reboots.
+
+Cannot be changed while recording — stop first.
+
+### `dur`
+Show the current duration without changing it.
+
+---
+
 ### `status`
 Print a full status report:
 
@@ -233,6 +260,7 @@ Print a full status report:
 Device ID:   VC-832924
 MAC Address: 84:1f:e8:83:29:24
 Firmware:    1.0.0
+Rec Duration:60 s (continuous mode, range 10-120 s)
 Device Token: dvt_abc123  (or "(none — using MAC routing)")
 WiFi SSID:   barnhill tavern
 WiFi Status: Connected
@@ -284,17 +312,24 @@ defaults.
 | `DEFAULT_DEVICE_TOKEN` | `""` | Portal token (empty = MAC routing) |
 | `SAMPLE_RATE` | `8000` | Audio sample rate in Hz |
 | `BITS_PER_SAMPLE` | `16` | PCM bit depth |
-| `RECORD_DURATION_SEC` | `15` | Chunk length in seconds |
+| `RECORD_DURATION_SEC` | `60` | Default chunk length in seconds |
+| `MIN_RECORD_DURATION_SEC` | `10` | Shortest allowed duration |
+| `MAX_RECORD_DURATION_SEC` | `120` | Longest allowed duration (PSRAM budget) |
+| `CONT_MAX_DURATION_SEC` | `60` | Maximum duration for continuous mode |
 | `SD_MIN_FREE_BYTES` | `20 MB` | Minimum free SD space before rotation |
 
-### Derived constants
+### Buffer sizing
 
-| Constant | Value | Meaning |
-|----------|-------|---------|
-| `AUDIO_SAMPLES` | 120 000 | Samples per 15-second chunk |
-| `AUDIO_PCM_BYTES` | 240 000 B | Raw 16-bit PCM buffer (≈ 234 KB) |
-| `WAV_TOTAL_BYTES` | 240 044 B | PCM + 44-byte RIFF/WAV header |
-| `B64_OUTPUT_SIZE` | ≥ 320 076 B | Maximum base64url-encoded size |
+Buffer allocation is computed at runtime from the current `recordDurationSec`
+value via inline helpers `audioSampleTarget()` and `audioPcmBytes()`. At 8 kHz /
+16-bit mono:
+
+| Duration | PCM buffer | JSON peak | Continuous peak |
+|----------|-----------|-----------|-----------------|
+| 30 s | 480 KB | ~1.6 MB | ~2.1 MB ✓ |
+| 60 s | 960 KB | ~3.2 MB | ~4.2 MB ✓ |
+| 90 s | 1.4 MB | ~4.8 MB | ~6.2 MB ✗ (single-shot only) |
+| 120 s | 1.9 MB | ~6.4 MB | ✗ (single-shot only) |
 
 ---
 
