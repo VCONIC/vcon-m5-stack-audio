@@ -315,7 +315,7 @@ defaults.
 | `RECORD_DURATION_SEC` | `60` | Default chunk length in seconds |
 | `MIN_RECORD_DURATION_SEC` | `10` | Shortest allowed duration |
 | `MAX_RECORD_DURATION_SEC` | `120` | Longest allowed duration (PSRAM budget) |
-| `CONT_MAX_DURATION_SEC` | `60` | Maximum duration for continuous mode |
+| `CONT_MAX_DURATION_SEC` | `45` | Maximum duration for continuous mode (PSRAM limit) |
 | `SD_MIN_FREE_BYTES` | `20 MB` | Minimum free SD space before rotation |
 
 ### Buffer sizing
@@ -327,9 +327,10 @@ value via inline helpers `audioSampleTarget()` and `audioPcmBytes()`. At 8 kHz /
 | Duration | PCM buffer | JSON peak | Continuous peak |
 |----------|-----------|-----------|-----------------|
 | 30 s | 480 KB | ~1.6 MB | ~2.1 MB ✓ |
-| 60 s | 960 KB | ~3.2 MB | ~4.2 MB ✓ |
-| 90 s | 1.4 MB | ~4.8 MB | ~6.2 MB ✗ (single-shot only) |
-| 120 s | 1.9 MB | ~6.4 MB | ✗ (single-shot only) |
+| 45 s | 720 KB | ~2.4 MB | ~2.7 MB ✓ (~800 KB margin) |
+| 60 s | 960 KB | ~3.2 MB | ✗ single-shot only (49 KB over limit) |
+| 90 s | 1.4 MB | ~4.8 MB | ✗ single-shot only |
+| 120 s | 1.9 MB | ~6.4 MB | ✗ single-shot only |
 
 ---
 

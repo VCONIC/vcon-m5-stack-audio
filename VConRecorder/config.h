@@ -23,7 +23,7 @@
 
 // Firmware version — must match /public/version.txt on the OTA server
 // when this build is the current release.
-#define FIRMWARE_VERSION      "1.0.2"
+#define FIRMWARE_VERSION      "1.0.3"
 
 // OTA endpoints — served as static files from the same Replit host
 #define OTA_VERSION_URL       "https://vcon-gateway.replit.app/api/ota/version.txt"
@@ -46,9 +46,11 @@
 #define MAX_RECORD_DURATION_SEC 120  // longest allowed (PSRAM budget; see note below)
 
 // Continuous dual-buffer mode requires two full PCM buffers in PSRAM simultaneously.
-// Above this threshold the firmware automatically falls back to single-shot mode so
-// that only one buffer is live at a time, keeping peak PSRAM usage under ~5 MB.
-#define CONT_MAX_DURATION_SEC   60
+// At 60 s the two PCM buffers (2 × 960 KB) consume ~1.92 MB, leaving only ~2.1 MB
+// for the JSON buffer (~1.22 MB) + WAV staging (~960 KB) — about 49 KB short.
+// 45 s gives a comfortable ~800 KB margin: encode peak ~1.68 MB vs ~2.67 MB free.
+// Above this threshold the firmware automatically falls back to single-shot mode.
+#define CONT_MAX_DURATION_SEC   45
 
 // ---- Buffer sizes are now computed at runtime from recordDurationSec ----
 // Use the inline helpers audioSampleTarget() / audioPcmBytes() in the sketch.
