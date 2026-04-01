@@ -1,12 +1,12 @@
 # M5Stack Core2 — VConic vCon Audio Recorder
 
-Continuously records audio from the M5Stack Core2's built-in microphone and
-publishes each 15-second chunk as a spec-compliant
-[vCon](https://datatracker.ietf.org/doc/draft-ietf-vcon-vcon-core/) JSON
-document (IETF draft-ietf-vcon-vcon-core v0.4.0) to the
-[VConic gateway](https://vcon-gateway.replit.app). Every recording is
-simultaneously saved to a microSD card as a raw WAV file and the complete
-vCon JSON, organized into date/hour directories with automatic rotation.
+Records audio from the M5Stack Core2's built-in microphone and publishes each
+chunk as a spec-compliant [vCon](https://datatracker.ietf.org/doc/draft-ietf-vcon-vcon-core/)
+JSON document (IETF draft-ietf-vcon-vcon-core v0.4.0) to the
+[VConic gateway](https://vcon-gateway.replit.app). Recordings are configurable
+from 10–120 seconds, run continuously with zero-gap dual-buffer mode (≤ 45 s),
+and are simultaneously saved to a microSD card organized into date/hour
+directories with automatic rotation.
 
 ---
 
@@ -66,116 +66,166 @@ vCon JSON, organized into date/hour directories with automatic rotation.
    Without a token, recordings are submitted as unassigned and can be claimed
    in the VConic portal by MAC address.
 5. **Insert** a FAT32-formatted microSD card (optional).
-6. **Press Button A (RUN)** to begin continuous recording and posting.
-7. **Press Button B (STOP)** to finish the current chunk and go idle.
+6. On the **HOME screen**, press **Button A (RUN)** to begin continuous
+   recording and posting.
+7. Press **Button B (STOP)** to finish the current chunk and return to idle.
 
 ---
 
 ## 3. User Interface
 
-### Splash Screen
+The display uses a four-screen navigation system. Each screen occupies the
+full 320 × 240 display with a shared 8 px VConic green (#30CC30) hazard strip
+at the top and a 46 px button row at the bottom.
 
-On boot the device shows the VConic logo with the device's unique identifier
-(`VC-XXXXXX`) centered below it for 10 seconds.
+### HOME Screen (default)
 
-### Main Display
-
-The display is divided into a factory-instrument-style panel layout using
-VConic green (#30CC30) for all panel chrome.
+The main at-a-glance view shown on boot and after any inactivity timeout
+(60 seconds).
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓ HAZARD STRIP ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │ y=0
-├──────────┬────────────────────────────┬───────────────────────────┤ y=8
-│  WIFI    │   M5STACK VCON RECORDER    │   STATE                   │
-│ CONNECTED│       HH:MM:SS             │   IDLE                    │
-│ -42 dBm  │       YYYY-MM-DD           │   UP: 00:03:21            │
-│ barnhill │                            │   2048KB                  │
-├──────────┼────────────────────────────┼───────────────────────────┤ y=68
-│  RECORD  │  MICROPHONE INPUT          │   vCON                    │
-│  Press   │  ┌─┐ ┌──┐ ┌─┐ ┌──┐ ┌──┐  │   UUID:                   │
-│  RUN     │  │ │ │  │ │ │ │  │ │  │  │   a54553f6f1               │
-│  to rec  │  └─┘ └──┘ └─┘ └──┘ └──┘  │   HTTP: 202               │
-│  OK:  3  │   (VU meter bars)          │   240.0KB                 │
-│  Err: 0  │                            │   POST #3                 │
-│  Buf:  0 │                            │   sd: 3                   │
-├──────────┴────────────────────────────┴───────────────────────────┤ y=156
-│  STATUS: Continuous: chunk 4...                                    │
-│  https://vcon-gateway.replit.app/ingress                          │
-├──────────────────────────────────────────────────────────────────┤ y=194
-│    [ RUN ]              [ STOP ]            [ CONFIG ]            │
-└──────────────────────────────────────────────────────────────────┘ y=240
+┌─────────────────────────────────────────────────────────────────┐
+│ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ HAZARD STRIP ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │ y=0
+├─────────────────────────────────────────────────────────────────┤ y=8
+│  WiFi: CONNECTED  192.168.1.42  -44 dBm   14:22:35 UTC         │
+│  SSID: barnhill tavern          NTP: yes  2026-04-01            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│                          IDLE                                    │
+│                     (large state text)                           │
+│                                                                  │
+├─────────────────────────────────────────────────────────────────┤
+│  OK: 148    Err: 8    Dur: 60s    Upload: —                     │
+├─────────────────────────────────────────────────────────────────┤
+│  VC-832924  84:1F:E8:83:29:24                                   │
+├─────────────────────────────────────────────────────────────────┤ y=194
+│    [ RUN ]              [ CONFIG ]           [ TOOLS ]          │
+└─────────────────────────────────────────────────────────────────┘ y=240
 ```
 
-### Panel Descriptions
+**Button labels change with state:**
 
-#### WIFI (top-left, 80 × 60 px)
-| State | Content |
-|-------|---------|
-| Connected | Green label, RSSI in dBm, SSID (truncated), NTP status |
-| Disconnected | Red label, instructions to use the `wifi` serial command |
+| App State | Button A | Button B | Button C |
+|-----------|----------|----------|----------|
+| IDLE | **RUN** | **CONFIG** | **TOOLS** |
+| RECORDING | _(dim)_ | **STOP** | **STATUS** |
+| PROCESSING | _(dim)_ | _(dim)_ | **STATUS** |
 
-#### TIME (top-center, 160 × 60 px)
-- Large HH:MM:SS clock (NTP-synced UTC)
-- YYYY-MM-DD date below
+---
 
-#### STATE (top-right, 80 × 60 px)
-| Colour | State |
-|--------|-------|
-| Green / black | IDLE |
-| Red / white | RECORDING or LIVE (continuous) |
-| Green / black | ENCODING or UPLOADING |
-| Green / black | SUCCESS |
-| Red / white | ERROR |
+### STATUS Screen
 
-Also shows device uptime and free PSRAM.
+Real-time recording dashboard — accessible via Button C while recording,
+or by navigating from any screen.
 
-#### RECORD (middle-left, 80 × 87 px)
-- **Idle:** "Press RUN to record", upload OK/error counts, buffer size
-- **Recording:** elapsed/total time (`MM:SS/00:15`), red progress bar, percentage
-- **Continuous:** elapsed/total time, green progress bar, chunk counter (`#N`)
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ HAZARD STRIP ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │
+├─────────────────────────────────────────────────────────────────┤
+│  MICROPHONE INPUT                                               │
+│  ┌──┐ ┌────┐ ┌──┐ ┌───┐ ┌──┐ ┌────┐ ┌──┐ ┌────┐ ┌──┐         │
+│  │  │ │    │ │  │ │   │ │  │ │    │ │  │ │    │ │  │         │
+│  └──┘ └────┘ └──┘ └───┘ └──┘ └────┘ └──┘ └────┘ └──┘         │
+├─────────────────────────────────────────────────────────────────┤
+│  Elapsed: 00:32 / 01:00   ████████████████░░░░░░░░  53%        │
+├─────────────────────────────────────────────────────────────────┤
+│  Upload: ENCODING                                               │
+├─────────────────────────────────────────────────────────────────┤
+│  UUID: a54553f6f1...                                            │
+├─────────────────────────────────────────────────────────────────┤
+│  OK: 148    Fail: 8                                             │
+├─────────────────────────────────────────────────────────────────┤
+│  Free PSRAM: 3187 KB                                            │
+├─────────────────────────────────────────────────────────────────┤
+│  Mode: single-shot    SD: 3 saved                               │
+├─────────────────────────────────────────────────────────────────┤
+│    [ HOME ]              [ — ]                [ — ]            │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-#### MICROPHONE INPUT (middle-center, 160 × 87 px)
-16-bar rolling VU meter:
-- **Green** — normal level (< 40 % of peak)
-- **Yellow** — moderate level (40–70 %)
-- **Red** — high level (> 70 %)
-- **Flat line** — idle (not recording)
+| Region | Content |
+|--------|---------|
+| VU meter | 16-bar rolling level display (green / yellow / red) |
+| Progress | Elapsed MM:SS / total, filled progress bar, percentage |
+| Upload | Current upload-task state: IDLE, ENCODING, SD, POST, OK, FAIL |
+| UUID | Last 10 chars of most-recent vCon UUID |
+| Counters | Total OK posts and failures this session |
+| Buffer | Free PSRAM in KB |
+| Mode | `continuous` or `single-shot`, plus SD save count |
 
-#### vCON (middle-right, 80 × 87 px)
-| Row | Description |
-|-----|-------------|
-| UUID | Last 10 chars of most recent vCon UUID |
-| HTTP | Response code from last POST (202 = routed, 200 = unassigned) |
-| Buffer KB | Size of captured PCM audio |
-| Upload state | In continuous mode: `ENC`, `SD`, `POST`, `OK`, `FAIL`, or `RTRY #N` |
-| sd: N | Recordings saved to SD this session |
+---
 
-#### STATUS ROW (y = 156–193)
-- **Continuous/Recording:** full-width progress bar + status message
-- **Idle:** human-readable status string and current POST URL
+### CONFIG Screen
 
-#### BUTTON ROW (y = 194–239)
+Read-only view of all current settings — no interaction needed, just a
+reference you can check without opening a serial terminal.
 
-| Button | Label | Function |
-|--------|-------|----------|
-| A (left) | **RUN** | Start continuous record+post loop |
-| B (center) | **STOP** | Finish current chunk then stop; or abort single-shot early |
-| C (right) | **CONFIG** | Open the configuration screen |
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ HAZARD STRIP ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │
+│  CONFIGURATION                                                  │
+│  Device ID:  VC-832924                                          │
+│  MAC:        84:1F:E8:83:29:24                                  │
+│  Firmware:   1.0.4                                              │
+│  Token:      (none — MAC routing)                               │
+│  WiFi:       barnhill tavern — CONNECTED                        │
+│  IP:         192.168.86.33   RSSI: -44 dBm                      │
+│  NTP:        yes  2026-04-01T14:22:35Z                          │
+│  Duration:   60 s  (single-shot)                                │
+│  URL: https://vcon-gateway.replit.app/ingress                   │
+│  ─────────────────────────────────────────────────────          │
+│  Serial commands: wifi  url  token  dur                         │
+│                   status  scan  sd  restart  help               │
+├─────────────────────────────────────────────────────────────────┤
+│    [ HOME ]              [ — ]                [ — ]            │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-RUN is grey while recording/processing. STOP is red only while active.
+---
 
-### Config Screen (Button C)
-A full-screen modal showing:
-- Device ID (`VC-XXXXXX`) and MAC address
-- Portal token (or "(none)" if using MAC routing)
-- WiFi SSID, status, IP, RSSI
-- NTP sync status and current UTC timestamp
-- SD card status and session save count
-- POST URL (word-wrapped)
-- Available serial commands as a quick reference
+### TOOLS Screen
 
-Press **any button** to dismiss.
+On-device diagnostics — run tests and check connectivity without a computer.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ HAZARD STRIP ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │
+│  TOOLS & DIAGNOSTICS                                            │
+│                                                                  │
+│    ▶  WiFi Test                                                 │
+│       OTA Check                                                 │
+│       POST Test                                                 │
+│       SD Info                                                   │
+│       Restart                                                   │
+│                                                                  │
+├─────────────────────────────────────────────────────────────────┤
+│    [ HOME ]           [ SELECT ]            [ RUN ]            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Tools:**
+
+| Tool | What it does |
+|------|-------------|
+| **WiFi Test** | Reconnects to configured SSID; reports IP and RSSI |
+| **OTA Check** | Fetches `version.txt` and compares to local firmware version (no flash/reboot) |
+| **POST Test** | Allocates 1 s of silence, builds a vCon, POSTs it; reports HTTP response code |
+| **SD Info** | Shows SD total / used / free space and session save count |
+| **Restart** | Soft-resets the device (shows confirmation prompt first) |
+
+**Navigation:**
+- **Button A** → back to HOME
+- **Button B** → move cursor up/down through menu items
+- **Button C** → run selected tool (or confirm/cancel on the restart prompt)
+
+Results are shown for 8 seconds then automatically return to the menu.
+
+---
+
+### Inactivity Timeout
+
+Any screen other than HOME automatically returns to HOME after **60 seconds**
+of no button activity.
 
 ---
 
@@ -234,9 +284,9 @@ dur 30     # 30 seconds
 dur 120    # 2 minutes (single-shot only)
 ```
 
-- **10–60 s** → continuous dual-buffer mode available (recording continues
+- **10–45 s** → continuous dual-buffer mode available (recording continues
   without gaps while the previous chunk uploads in parallel on core 0).
-- **61–120 s** → single-shot mode only; the device records one chunk, encodes
+- **46–120 s** → single-shot mode only; the device records one chunk, encodes
   and uploads it, then waits for the next RUN press. This is automatic — no
   extra configuration needed.
 
@@ -257,21 +307,21 @@ Print a full status report:
 
 ```
 === vCon Recorder Status ===
+Firmware:    1.0.4
 Device ID:   VC-832924
-MAC Address: 84:1f:e8:83:29:24
-Firmware:    1.0.0
-Rec Duration:60 s (continuous mode, range 10-120 s)
-Device Token: dvt_abc123  (or "(none — using MAC routing)")
+MAC Address: 84:1F:E8:83:29:24
+Rec Duration:60 s (single-shot mode, range 10-120 s)
+Device Token:(none — using MAC routing)
 WiFi SSID:   barnhill tavern
 WiFi Status: Connected
-IP Address:  192.168.1.42
-RSSI:        -42 dBm
+IP Address:  192.168.86.33
+RSSI:        -44 dBm
 NTP Synced:  Yes
 POST URL:    https://vcon-gateway.replit.app/ingress
-Total OK:    12
-Total Fail:  0
-Free Heap:   201372 bytes
-Free PSRAM:  2138260 bytes
+Total OK:    148
+Total Fail:  8
+Free Heap:   174280 bytes
+Free PSRAM:  3187372 bytes
 App State:   0
 ============================
 ```
@@ -310,13 +360,15 @@ defaults.
 | `DEFAULT_WIFI_PASSWORD` | `"meteormeteor"` | Initial password |
 | `DEFAULT_POST_URL` | `https://vcon-gateway.replit.app/ingress` | VConic gateway |
 | `DEFAULT_DEVICE_TOKEN` | `""` | Portal token (empty = MAC routing) |
+| `FIRMWARE_VERSION` | `"1.0.4"` | Current firmware version |
 | `SAMPLE_RATE` | `8000` | Audio sample rate in Hz |
 | `BITS_PER_SAMPLE` | `16` | PCM bit depth |
 | `RECORD_DURATION_SEC` | `60` | Default chunk length in seconds |
 | `MIN_RECORD_DURATION_SEC` | `10` | Shortest allowed duration |
 | `MAX_RECORD_DURATION_SEC` | `120` | Longest allowed duration (PSRAM budget) |
-| `CONT_MAX_DURATION_SEC` | `45` | Maximum duration for continuous mode (PSRAM limit) |
-| `SD_MIN_FREE_BYTES` | `20 MB` | Minimum free SD space before rotation |
+| `CONT_MAX_DURATION_SEC` | `45` | Maximum duration for continuous dual-buffer mode |
+| `OTA_VERSION_URL` | `https://vcon-gateway.replit.app/api/ota/version.txt` | OTA version check endpoint |
+| `OTA_FIRMWARE_URL` | `https://vcon-gateway.replit.app/api/ota/firmware.bin` | OTA binary download endpoint |
 
 ### Buffer sizing
 
@@ -370,7 +422,7 @@ this field for MAC-based device routing when no token is provided.
 "dialog": [{
   "type": "recording",
   "start": "2026-04-01T14:22:00Z",
-  "duration": 15,
+  "duration": 60,
   "parties": [0],
   "originator": 0,
   "mimetype": "audio/wav",
@@ -380,7 +432,7 @@ this field for MAC-based device routing when no token is provided.
 ```
 
 `duration` reflects the actual captured seconds (`audioBufferIndex / SAMPLE_RATE`),
-which may be less than 15 when STOP is pressed mid-chunk.
+which may be less than the configured value when STOP is pressed mid-chunk.
 
 ### `attachments` array
 
@@ -391,7 +443,7 @@ which may be less than 15 when STOP is pressed mid-chunk.
   "party": 0,
   "dialog": 0,
   "encoding": "json",
-  "body": "{\"source\":\"m5stack-core2\",\"device_id\":\"VC-832924\",\"mac\":\"84:1f:e8:83:29:24\",\"sample_rate\":8000,\"duration_seconds\":15}"
+  "body": "{\"source\":\"m5stack-core2\",\"device_id\":\"VC-832924\",\"mac\":\"84:1f:e8:83:29:24\",\"sample_rate\":8000,\"duration_seconds\":60}"
 }]
 ```
 
@@ -471,24 +523,28 @@ A recording is always on the card before the POST is attempted.
 
 ### PSRAM budget
 
-#### Normal (single-shot) mode
+#### Normal (single-shot) mode — 60 s example
 
 | Region | Size | Lifetime |
 |--------|------|----------|
-| Audio PCM buffer A | 240 000 B (≈ 234 KB) | Persistent |
-| vCon JSON buffer | ≈ 321 000 B (≈ 314 KB) | During encode/upload |
-| WAV staging buffer | 240 044 B (≈ 235 KB) | Briefly during encode |
-| **Peak total** | **≈ 795 KB** | Well within ≈ 3.4 MB available |
+| Audio PCM buffer A | 960 000 B (≈ 938 KB) | Persistent |
+| vCon JSON buffer | ≈ 1 280 000 B (≈ 1 250 KB) | During encode/upload |
+| WAV staging buffer | 960 044 B (≈ 938 KB) | Briefly during encode |
+| **Peak total** | **≈ 3.1 MB** | Within ≈ 4 MB available |
 
-#### Continuous mode (dual-buffer)
+#### Continuous mode (dual-buffer) — 45 s example
 
 | Region | Size | Lifetime |
 |--------|------|----------|
-| Audio buffer A | 240 000 B | Persistent — alternates as record/upload buffer |
-| Audio buffer B | 240 000 B | Persistent — allocated on first RUN press |
-| vCon JSON buffer | ≈ 321 000 B | During encode on core 0 |
-| WAV staging buffer | 240 044 B | Briefly during encode |
-| **Peak total** | **≈ 1 041 KB** | Well within available PSRAM |
+| Audio buffer A | 720 000 B (≈ 703 KB) | Persistent |
+| Audio buffer B | 720 000 B (≈ 703 KB) | Persistent |
+| vCon JSON buffer | ≈ 960 000 B (≈ 938 KB) | During encode on core 0 |
+| WAV staging buffer | 720 044 B (≈ 703 KB) | Briefly during encode |
+| **Peak total** | **≈ 2.9 MB** | ~800 KB below ≈ 3.7 MB available |
+
+> At 60 s, continuous mode would need ~4.16 MB but only ~4.02 MB is available
+> after WiFi/IDF overhead — a 49 KB shortfall. The firmware automatically uses
+> single-shot mode for durations above `CONT_MAX_DURATION_SEC` (45 s).
 
 ### Dual-buffer continuous recording
 
@@ -497,14 +553,14 @@ In continuous mode the ESP32's two cores work independently:
 - **Core 1 (main loop):** mic DMA recording, display updates, button events
 - **Core 0 (upload task):** base64 encoding, SD write, HTTP POST
 
-When a 15-second chunk completes:
+When a chunk completes:
 1. Core 1 swaps the recording pointer to the alternate buffer and immediately
    continues filling it — **zero recording gap**.
 2. The completed buffer is handed to a FreeRTOS task on core 0 for
    encoding and upload.
-3. Both cores run simultaneously for the next 15 seconds.
+3. Both cores run simultaneously for the next chunk.
 
-If the upload takes longer than 15 seconds (e.g. very slow WiFi), the
+If the upload takes longer than the chunk duration (e.g. very slow WiFi), the
 recording buffer stretches until the task finishes, then swaps cleanly.
 
 ### Single-buffer encoding strategy
@@ -530,31 +586,34 @@ On macOS, arduino-cli is bundled inside the Arduino IDE app:
 /Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli
 ```
 
-Create a shell alias for convenience:
+Or install standalone via Homebrew:
 ```bash
-alias arduino-cli="/Applications/Arduino\ IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli"
+brew install arduino-cli
 ```
 
 ### Compile
 
-The sketch requires the **Minimal SPIFFS (1.9 MB APP with OTA)** partition scheme
-so the ESP32 has two equal-sized OTA partitions for over-the-air updates.
-Pass it via the FQBN `PartitionScheme` option:
+The sketch requires the **Minimal SPIFFS (1.9 MB APP with OTA)** partition
+scheme so the ESP32 has two equal-sized OTA partitions for over-the-air
+updates. Pass it via build properties:
 
 ```bash
 arduino-cli compile \
-  --fqbn esp32:esp32:m5stack_core2:PartitionScheme=min_spiffs \
-  VConRecorder/
+  --fqbn esp32:esp32:m5stack_core2 \
+  --build-property "build.partitions=min_spiffs" \
+  --build-property "upload.maximum_size=1966080" \
+  --output-dir VConRecorder/build \
+  VConRecorder/VConRecorder.ino
 ```
 
 A successful build reports roughly:
 ```
-Sketch uses 1410907 bytes (71%) of program storage space.  Maximum is 1966080 bytes.
-Global variables use 52268 bytes (1%) of dynamic memory.
+Sketch uses 1418051 bytes (72%) of program storage space.  Maximum is 1966080 bytes.
+Global variables use 54588 bytes (1%) of dynamic memory.
 ```
 
-> **Why 71%?** The `min_spiffs` scheme allocates two 1.9 MB OTA app partitions.
-> The sketch fits with ~555 KB to spare — enough headroom for future growth.
+> **Why 72%?** The `min_spiffs` scheme allocates two 1.9 MB OTA app partitions.
+> The sketch fits with ~550 KB to spare — enough headroom for future growth.
 
 ### Flash
 
@@ -562,7 +621,8 @@ Global variables use 52268 bytes (1%) of dynamic memory.
 arduino-cli upload \
   --fqbn esp32:esp32:m5stack_core2 \
   --port /dev/cu.usbserial-5B212355431 \
-  VConRecorder/
+  --input-dir VConRecorder/build \
+  VConRecorder/VConRecorder.ino
 ```
 
 Replace the port with your device's actual serial port
@@ -589,7 +649,7 @@ cable or computer required.
 boot → WiFi connected
          │
          ▼
-   GET /version.txt        ← plain-text remote version string  (e.g. "1.0.1")
+   GET /api/ota/version.txt   ← plain-text remote version string  (e.g. "1.0.4")
          │
    compare to FIRMWARE_VERSION baked into this build
          │
@@ -597,7 +657,7 @@ boot → WiFi connected
          │
          NO
          ▼
-   GET /firmware.bin       ← raw ESP32 .bin, Content-Length required
+   GET /api/ota/firmware.bin  ← raw ESP32 .bin, Content-Length required
          │
    stream into the inactive OTA partition via ESP32 Update library
          │
@@ -610,48 +670,103 @@ boot → WiFi connected
 |----------|-----------|
 | Remote version == local | Skip update, log `[OTA] firmware is current` |
 | Remote version != local | Download and flash, then reboot |
-| `/version.txt` returns non-200 | Log error, continue boot normally |
-| `/firmware.bin` missing Content-Length | Abort, continue boot normally |
+| `/api/ota/version.txt` returns non-200 | Log error, continue boot normally |
+| `/api/ota/firmware.bin` missing Content-Length | Abort, continue boot normally |
 | Flash write error | Log error, continue boot normally (old firmware intact) |
 
 ### Serial output
 
 ```
-[OTA] local=1.0.0  remote=1.0.1
-[OTA] update available (1.0.0 → 1.0.1), downloading...
-[OTA] binary size: 1410907 bytes
-[OTA]  141090 / 1410907 bytes (10%)
-[OTA]  282180 / 1410907 bytes (20%)
+[OTA] local=1.0.3  remote=1.0.4
+[OTA] update available (1.0.3 → 1.0.4), downloading...
+[OTA] binary size: 1418192 bytes
+[OTA]  141819 / 1418192 bytes (10%)
+[OTA]  283638 / 1418192 bytes (20%)
 ...
-[OTA] 1410907 / 1410907 bytes (100%)
+[OTA] 1418192 / 1418192 bytes (100%)
 [OTA] success — rebooting in 1 s...
 ```
 
 ### Shipping a firmware update
 
-1. **Export the compiled binary** in Arduino IDE: *Sketch → Export Compiled Binary*.
-   The file lands at `VConRecorder/build/esp32.esp32.m5stack_core2/VConRecorder.ino.bin`.
-2. **Rename** it `firmware.bin`.
-3. **Upload `firmware.bin`** to the OTA server (Replit: *Files → public → firmware.bin*).
-4. **Update `version.txt`** on the server to the new version string (e.g. `1.0.1`).
+#### Step 1 — Compile and note the binary path
+
+```bash
+arduino-cli compile \
+  --fqbn esp32:esp32:m5stack_core2 \
+  --build-property "build.partitions=min_spiffs" \
+  --build-property "upload.maximum_size=1966080" \
+  --output-dir VConRecorder/build \
+  VConRecorder/VConRecorder.ino
+```
+
+Binary lands at:
+```
+VConRecorder/build/esp32.esp32.m5stack_core2/VConRecorder.ino.bin
+```
+
+#### Step 2 — Get an auth token
+
+```bash
+TOKEN=$(curl -s -X POST https://vcon-gateway.replit.app/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"yourpassword"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+```
+
+#### Step 3 — Upload the firmware binary
+
+```bash
+python3 - <<PYEOF
+import base64, json, urllib.request
+
+with open("VConRecorder/build/esp32.esp32.m5stack_core2/VConRecorder.ino.bin", "rb") as f:
+    data = base64.b64encode(f.read()).decode("ascii")
+
+payload = json.dumps({"firmwareBase64": data}).encode("utf-8")
+req = urllib.request.Request(
+    "https://vcon-gateway.replit.app/api/ota/firmware",
+    data=payload,
+    headers={"Authorization": f"Bearer $TOKEN", "Content-Type": "application/json"},
+    method="POST"
+)
+with urllib.request.urlopen(req, timeout=120) as resp:
+    print(resp.read().decode())
+PYEOF
+```
+
+> **macOS note:** `base64 -w0` is a Linux flag. Use Python (shown above) or
+> `base64 -b 0 -i firmware.bin` for reliable cross-platform encoding of
+> large binaries.
+
+#### Step 4 — Set the version string
+
+```bash
+curl -X PUT https://vcon-gateway.replit.app/api/ota/version \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"version":"1.0.4"}'
+```
+
+#### Step 5 — Verify (no auth required)
+
+```bash
+curl https://vcon-gateway.replit.app/api/ota/version.txt
+# → 1.0.4
+
+curl -I https://vcon-gateway.replit.app/api/ota/firmware.bin
+# → content-length: 1418192
+```
 
 > ⚠️ **Deploy order matters.** Always upload `firmware.bin` *before* updating
 > `version.txt`. Devices check the version string first — if `version.txt`
-> already says `1.0.1` but `firmware.bin` is still the old build, devices will
-> try to download a mismatched binary.
-
-### OTA configuration (`config.h`)
-
-| Constant | Default | Description |
-|----------|---------|-------------|
-| `FIRMWARE_VERSION` | `"1.0.0"` | Version baked into this build; must match `version.txt` when this is the current release |
-| `OTA_VERSION_URL` | `https://vcon-gateway.replit.app/version.txt` | Plain-text version endpoint |
-| `OTA_FIRMWARE_URL` | `https://vcon-gateway.replit.app/firmware.bin` | Raw binary download endpoint |
+> already shows the new version but `firmware.bin` is still the old build,
+> devices will try to download a mismatched binary.
 
 ### Partition scheme requirement
 
 OTA requires two equal-sized app partitions on the ESP32. The sketch must be
-compiled with `PartitionScheme=min_spiffs` (see [§9 Build & Flash](#9-build--flash)).
+compiled with `build.partitions=min_spiffs` (see [§9 Build & Flash](#9-build--flash)).
 Building with the default partition scheme disables OTA and the
 `Update.begin()` call will fail at runtime.
 
@@ -675,10 +790,15 @@ Look for a name containing `usbserial`, e.g.:
 ### Step 2 — Open a terminal session
 
 ```bash
-screen /dev/cu.usbserial-5B212355431 115200
+screen /dev/cu.usbserial-5B212355431 115200,crnl
 ```
 
+`crnl` enables correct CR/LF translation so lines wrap properly.
+
 **To exit:** press `Ctrl-A`, then `K`, then `Y`.
+
+**To enable local echo** (so you can see what you type):
+Press `Ctrl-A E` after opening the session.
 
 ---
 
@@ -692,19 +812,19 @@ arduino-cli monitor \
 ```
 Exit with `Ctrl-C`. Must be killed before flashing.
 
-**Python** (scripted commands):
+**Python** (scripted / non-interactive):
 ```bash
 # One-time setup
 python3 -m venv /tmp/venv && /tmp/venv/bin/pip install pyserial -q
 
-# Send a command
+# Send a command and read response
 /tmp/venv/bin/python3 - <<'EOF'
 import serial, time
-s = serial.Serial('/dev/cu.usbserial-5B212355431', 115200, timeout=2)
+s = serial.Serial('/dev/cu.usbserial-5B212355431', 115200, timeout=3)
 time.sleep(0.5)
-s.write(b'status\n')
-time.sleep(0.5)
-print(s.read(s.in_waiting).decode(errors='replace'))
+s.write(b'status\r\n')
+time.sleep(2)
+print(s.read(s.in_waiting or 4096).decode(errors='replace'))
 s.close()
 EOF
 ```
@@ -712,7 +832,7 @@ EOF
 ### Tip — see the full boot log
 
 Open the terminal session **before** pressing reset to see every `[init]`,
-`[wifi]`, `[sd]`, and `[ntp]` log line from startup.
+`[wifi]`, `[sd]`, `[ntp]`, and `[OTA]` log line from startup.
 
 ---
 
@@ -737,7 +857,7 @@ wifi My Network With Spaces thepassword
 
 ---
 
-### SD card not detected ("No SD" in vCON panel)
+### SD card not detected
 
 1. Format as **FAT32** (not exFAT or NTFS).
 2. Re-seat the card and send `restart`.
@@ -770,9 +890,22 @@ unassigned. Either:
 
 ### Continuous mode: recording pauses briefly
 
-If an upload takes longer than 15 seconds (very slow WiFi), the mic pauses
-while the previous chunk finishes uploading. Recording resumes automatically.
-Check RSSI in the WIFI panel — signal below -75 dBm will cause slow uploads.
+If an upload takes longer than the chunk duration (very slow WiFi), the mic
+pauses while the previous chunk finishes uploading. Recording resumes
+automatically. Check RSSI in the home screen — signal below -75 dBm causes
+slow uploads.
+
+---
+
+### OTA check returns HTTP 404 on boot
+
+```
+[OTA] version check failed: HTTP 404
+```
+
+The firmware binary or version string has not been uploaded to the OTA server
+yet. See [§10 Shipping a firmware update](#shipping-a-firmware-update) for the
+three-step upload process.
 
 ---
 
@@ -788,9 +921,9 @@ for a generic ESP32 or M5Stack Core (non-Core2).
 ```
 vcon-m5-stack-audio/
 ├── README.md                         ← This file
-├── CAPTIVE_PORTAL_IMPLEMENTATION_PLAN.md
+├── test_device.sh                    ← 17 automated device tests (pyserial)
 └── VConRecorder/
-    ├── VConRecorder.ino              ← Main Arduino sketch (~1 900 lines)
+    ├── VConRecorder.ino              ← Main Arduino sketch
     ├── config.h                      ← Compile-time defaults, buffer constants & OTA URLs
     ├── ota.h                         ← OTA update logic (HTTP poll + ESP32 Update library)
     └── logo.h                        ← VConic logo (RGB565, 310×110 px, PROGMEM)
@@ -806,21 +939,44 @@ vcon-m5-stack-audio/
 | `buildDateDir(buf, size, root)` | Build `/root/YYYY/MM/DD/HH` path from current time |
 | `mkdirP(path)` | Create directory tree (mkdir -p) |
 | `ensureSDSpace()` | Prune oldest hour-dirs if free space < 20 MB |
-| `saveWavToSD(buf, n, uuid)` | Stream WAV from explicit buffer to SD |
-| `saveVConToSD(uuid, json, len)` | Write JSON to SD |
+| `saveWavToSD(buf, n, uuid)` | Stream WAV from PSRAM buffer to SD |
+| `saveVConToSD(uuid, json, len)` | Write vCon JSON to SD |
 | `buildAndUploadVConCore(buf, n)` | Encode + SD save + HTTP POST (no display calls) |
 | `buildAndUploadVCon()` | Single-shot wrapper; calls core with globals |
-| `uploadTaskFn(param)` | FreeRTOS task (core 0): runs core for continuous mode |
+| `uploadTaskFn(param)` | FreeRTOS task (core 0): encode/upload for continuous mode |
 | `startUploadTask(buf, n)` | Launch upload task with given buffer |
 | `swapAndContinue()` | Swap dual buffers + launch upload task each chunk |
 | `allocateAudioBuffer()` | Allocate PSRAM buffer A at startup |
 | `allocateContinuousBuffers()` | Allocate PSRAM buffer B on first RUN press |
 | `startRecording()` | Initialise mic, set STATE_RECORDING or STATE_CONTINUOUS |
 | `recordAudioChunk()` | Capture 1 024 samples each loop() iteration |
-| `updateDisplay()` | Full screen redraw every 300 ms |
+| `updateDisplay()` | Screen dispatcher → one of four draw functions |
+| `drawHomeScreen()` | Connection/state/stats summary (default view) |
+| `drawStatusScreen()` | Real-time VU meter, progress, upload state |
+| `drawConfigScreen()` | Read-only settings reference |
+| `drawToolsScreen()` | 4-phase diagnostic tool menu |
+| `handleButtons()` | Central button dispatcher (delegates to per-screen handlers) |
+| `handleToolsButtons()` | TOOLS-screen button navigation and tool execution |
+| `toolsRunWifiTest()` | Reconnect WiFi, report IP + RSSI |
+| `toolsRunOtaTest()` | Fetch version.txt, compare to local (no flash/reboot) |
+| `toolsRunPostTest()` | POST 1 s silence vCon, report HTTP response code |
+| `toolsShowSD()` | Report SD total/used/free/saved |
 | `showLogoSplash()` | 10-second boot splash with device ID |
-| `showConfig()` | Modal config screen (Button C) |
 | `handleSerialCommand(cmd)` | Parse and execute serial commands |
+
+### Automated test script
+
+`test_device.sh` runs 17 tests against a live device over serial:
+
+```bash
+bash test_device.sh /dev/cu.usbserial-5B212355431
+```
+
+Tests cover: `status` field presence, firmware version format, WiFi
+connectivity, NTP sync, `dur` command, `url` command, `help` completeness,
+unknown-command handling, OTA endpoint HTTP 200 + Content-Length, device
+restart detection, post-reboot firmware version, and WiFi reconnect after
+restart.
 
 ---
 
@@ -841,4 +997,4 @@ except M5Unified which must be installed separately.
 
 ---
 
-*Updated 2026-04-01 — firmware: continuous dual-buffer mode, VConic gateway, SD rotation, OTA updates*
+*Updated 2026-04-01 — firmware 1.0.4: four-screen UI, on-device diagnostics, programmable duration, dual-buffer continuous recording, OTA updates*
