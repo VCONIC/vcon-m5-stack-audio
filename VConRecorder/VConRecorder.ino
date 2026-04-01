@@ -1,3 +1,4 @@
+
 // =============================================================================
 // M5Stack Core2 — vCon Audio Recorder  (VConic)
 // =============================================================================
@@ -601,13 +602,15 @@ void startRecording() {
     audioBuffer      = buf;   // recordAudioChunk() reads this global
     audioBufferIndex = 0;
 
-    // Configure M5Unified microphone
+    // Configure M5Unified microphone — always end() first for clean codec reset
+    M5.Mic.end();
     auto mic_cfg = M5.Mic.config();
     mic_cfg.sample_rate   = SAMPLE_RATE;
     mic_cfg.dma_buf_count = 16;
     mic_cfg.dma_buf_len   = 512;
     M5.Mic.config(mic_cfg);
     M5.Mic.begin();
+    delay(300);  // ES7210 codec needs ~250 ms to stabilise after reset
 
     isRecording   = true;
     recordStartMs = millis();
@@ -645,23 +648,31 @@ void recordAudioChunk() {
     }
 
     size_t chunk = min((size_t)1024, remaining);
-    if (M5.Mic.record(&audioBuffer[audioBufferIndex], chunk, SAMPLE_RATE)) {
-        // Apply 4× gain (same technique as m5go reference project)
+    // PSRAM cache coherency: M5Unified's DMA copy bypasses the CPU dcache, so
+    // reading back from the PSRAM buffer sees stale zeros.  Fix: record into a
+    // small SRAM chunk buffer, compute gain+peak there, then copy to PSRAM.
+    static int16_t DRAM_ATTR sramChunk[1024];   // 2 KB in internal SRAM
+    if (M5.Mic.record(sramChunk, chunk, SAMPLE_RATE)) {
+        // Apply 4× gain and track peak — all from SRAM, no cache issues
+        int peakVal = 0;
         for (size_t i = 0; i < chunk; i++) {
-            int32_t s = (int32_t)audioBuffer[audioBufferIndex + i] * 4;
+            int32_t s = (int32_t)sramChunk[i] * 4;
             if (s >  32767) s =  32767;
             if (s < -32768) s = -32768;
-            audioBuffer[audioBufferIndex + i] = (int16_t)s;
+            sramChunk[i] = (int16_t)s;
+            int av = (s < 0) ? (int)(-s) : (int)s;
+            if (av > peakVal) peakVal = av;
         }
-        // Track peak amplitude for the level meter
-        int16_t peak = 0;
-        for (size_t i = 0; i < chunk; i++) {
-            int16_t av = abs(audioBuffer[audioBufferIndex + i]);
-            if (av > peak) peak = av;
-        }
-        levelHistory[levelIdx % LEVEL_BARS] = peak;
+        // Copy gain-applied SRAM chunk → PSRAM main buffer
+        memcpy(&audioBuffer[audioBufferIndex], sramChunk, chunk * sizeof(int16_t));
+
+        // Store peak directly as int (levelHistory is int[])
+        levelHistory[levelIdx % LEVEL_BARS] = peakVal;
         levelIdx++;
         audioBufferIndex += chunk;
+    } else {
+        // Mic not ready yet — normal during the first few ms after begin()
+        delay(1);
     }
 
     // Check elapsed time
@@ -1299,43 +1310,39 @@ void updateDisplay() {
         M5.Display.setCursor(3, 134); M5.Display.printf("Buf: %zuKB", audioBufferIndex * 2 / 1024);
     }
 
-    // -- AUDIO panel (x=80, y=69, 160×87) via off-screen sprite --
-    // Every draw call goes into a 160×87 RAM buffer; a single pushSprite() then
-    // blasts the whole panel to the display in one SPI burst.  This makes the
-    // update completely atomic — no partial frames, no flicker, no stale pixels.
+    // -- AUDIO panel (x=80, y=69, 160×87) drawn directly --
     {
+        const int px = 80, py = 69, pw = 160, ph = 87;
         uint16_t audioBorder = activeRec ? TFT_RED : VC_GREEN;
 
-        audioSprite.fillScreen(TFT_BLACK);
-        audioSprite.drawRect(0, 0, 160, 87, audioBorder);
-        audioSprite.fillRect(1, 1, 158, 12, VC_GREEN);
-        audioSprite.setTextSize(1);
-        audioSprite.setTextColor(TFT_BLACK, VC_GREEN);
-        audioSprite.setCursor(3, 3);
-        audioSprite.print("MICROPHONE INPUT");
+        M5.Display.fillRect(px, py, pw, ph, TFT_BLACK);
+        M5.Display.drawRect(px, py, pw, ph, audioBorder);
+        M5.Display.fillRect(px + 1, py + 1, pw - 2, 12, VC_GREEN);
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_BLACK, VC_GREEN);
+        M5.Display.setCursor(px + 3, py + 3);
+        M5.Display.print("MICROPHONE INPUT");
 
-        // Bars sub-region inside sprite: 1 px margin, 14 px from top
-        const int bx0 = 1, by0 = 14, bw = 158, bh = 71;
+        // Bars sub-region: 1 px margin inside border, 14 px from top
+        const int bx0 = px + 1, by0 = py + 14, bw = pw - 2, bh = ph - 15;
         const int barW = (bw - LEVEL_BARS) / LEVEL_BARS;  // = 8 px
 
-        if (!activeRec) {
-            audioSprite.drawFastHLine(bx0, by0 + bh / 2, bw, 0x2945u);
-        } else {
+        // Baseline always visible
+        M5.Display.drawFastHLine(bx0, by0 + bh - 1, bw, 0x2945u);
+
+        if (activeRec) {
             for (int i = 0; i < LEVEL_BARS; i++) {
                 int idx   = (levelIdx - LEVEL_BARS + i + LEVEL_BARS * 2) % LEVEL_BARS;
                 int level = levelHistory[idx];
                 int barH  = (int)((float)level / 32767.0f * (float)bh);
+                if (barH < 1) barH = 1;
                 int bx    = bx0 + i * (barW + 1);
-                if (barH > 0) {
-                    uint16_t col = TFT_GREEN;
-                    if      (barH > bh * 70 / 100) col = TFT_RED;
-                    else if (barH > bh * 40 / 100) col = TFT_YELLOW;
-                    audioSprite.fillRect(bx, by0 + bh - barH, barW, barH, col);
-                }
+                uint16_t col = TFT_GREEN;
+                if      (barH > bh * 70 / 100) col = TFT_RED;
+                else if (barH > bh * 40 / 100) col = TFT_YELLOW;
+                M5.Display.fillRect(bx, by0 + bh - barH, barW, barH, col);
             }
         }
-
-        audioSprite.pushSprite(80, 69);
     }
 
     // -- vCON panel (x=240, y=69, 80×87) --
