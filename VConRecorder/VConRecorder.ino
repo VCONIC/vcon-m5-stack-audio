@@ -30,6 +30,7 @@
 #include <SD.h>
 #include "config.h"
 #include "logo.h"
+#include "ota.h"
 
 // =============================================================================
 // State Machine
@@ -1585,6 +1586,7 @@ void handleSerialCommand(const String& cmd) {
         Serial.println("[cmd] Device token cleared — will use MAC routing");
     } else if (cmd == "status") {
         Serial.println("\n=== vCon Recorder Status ===");
+        Serial.printf("Firmware:    %s\n", FIRMWARE_VERSION);
         Serial.printf("Device ID:   %s\n", deviceID.c_str());
         Serial.printf("MAC Address: %s\n", WiFi.macAddress().c_str());
         Serial.printf("Device Token:%s\n",
@@ -1777,6 +1779,15 @@ void setup() {
     M5.Display.print("Connecting WiFi...");
 
     connectWiFi();
+
+    // OTA check — only when WiFi is up; blocks until done or skipped
+    if (wifiConnected) {
+        M5.Display.setCursor(40, 145);
+        M5.Display.print("Checking for update...");
+        checkForOTA(Serial);   // reboots here if a new firmware is flashed
+        M5.Display.fillRect(40, 145, 240, 10, TFT_BLACK);  // clear line
+    }
+
     initNTP();
 
     updateDisplay();

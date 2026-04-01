@@ -21,6 +21,14 @@
 // vCon POST endpoint default
 #define DEFAULT_POST_URL      "https://vcon-gateway.replit.app/ingress"
 
+// Firmware version — must match /public/version.txt on the OTA server
+// when this build is the current release.
+#define FIRMWARE_VERSION      "1.0.0"
+
+// OTA endpoints — served as static files from the same Replit host
+#define OTA_VERSION_URL       "https://vcon-gateway.replit.app/version.txt"
+#define OTA_FIRMWARE_URL      "https://vcon-gateway.replit.app/firmware.bin"
+
 // VConic portal device token (optional).
 // When set, appended as ?token=<value> and sent as X-Device-Token header.
 // Leave empty to fall back to MAC-address routing.
