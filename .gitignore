@@ -1,0 +1,24 @@
+# Arduino build artifacts — keep firmware.bin, ignore everything else
+VConRecorder/build/**/*.elf
+VConRecorder/build/**/*.map
+VConRecorder/build/**/*.bootloader.bin
+VConRecorder/build/**/*.merged.bin
+VConRecorder/build/**/*.partitions.bin
+VConRecorder/build/**/VConRecorder.ino.bin
+VConRecorder/build/**/boot_app0.bin
+VConRecorder/build/**/build.options.json
+VConRecorder/build/**/flash_args
+VConRecorder/build/**/partitions.csv
+VConRecorder/build/**/sdkconfig
+
+# Top-level build symlink artifacts
+VConRecorder/build/*.bin
+VConRecorder/build/*.elf
+VConRecorder/build/*.map
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+*.swp
