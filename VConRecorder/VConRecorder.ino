@@ -737,22 +737,28 @@ void recordAudioChunk() {
     }
 
     size_t chunk = min((size_t)1024, remaining);
-    // PSRAM cache coherency: M5Unified's DMA copy bypasses the CPU dcache, so
-    // reading back from the PSRAM buffer sees stale zeros.  Fix: record into a
-    // small SRAM chunk buffer, compute gain+peak there, then copy to PSRAM.
+    // M5Unified 0.2.13: Mic.record() is NON-BLOCKING — it queues the buffer
+    // for async DMA fill and returns immediately.  Reading sramChunk right after
+    // the call would return stale zeros.  Fix: wait until isRecording()==0
+    // (both internal DMA slots drained) before reading the buffer.
+    //
+    // M5Unified already applies f_gain = magnification/(over_sampling×2) = 4×
+    // internally.  Do NOT add additional software gain here — double-gain causes
+    // hard clipping that sounds like heavy distortion on normal speech.
     static int16_t DRAM_ATTR sramChunk[1024];   // 2 KB in internal SRAM
     if (M5.Mic.record(sramChunk, chunk, SAMPLE_RATE)) {
-        // Apply 4× gain and track peak — all from SRAM, no cache issues
+        // Wait for the DMA task to finish filling sramChunk (≤ ~200 ms at 8 kHz).
+        uint32_t t0 = millis();
+        while (M5.Mic.isRecording() && (millis() - t0 < 500)) { delay(1); }
+
+        // Track peak for VU meter — no gain modification (M5Unified handles it)
         int peakVal = 0;
         for (size_t i = 0; i < chunk; i++) {
-            int32_t s = (int32_t)sramChunk[i] * 4;
-            if (s >  32767) s =  32767;
-            if (s < -32768) s = -32768;
-            sramChunk[i] = (int16_t)s;
-            int av = (s < 0) ? (int)(-s) : (int)s;
+            int av = (int)sramChunk[i];
+            if (av < 0) av = -av;
             if (av > peakVal) peakVal = av;
         }
-        // Copy gain-applied SRAM chunk → PSRAM main buffer
+        // Copy filled SRAM chunk → PSRAM main buffer
         memcpy(&audioBuffer[audioBufferIndex], sramChunk, chunk * sizeof(int16_t));
 
         // Store peak directly as int (levelHistory is int[])
