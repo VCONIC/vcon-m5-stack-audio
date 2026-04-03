@@ -23,7 +23,7 @@
 
 // Firmware version — must match /public/version.txt on the OTA server
 // when this build is the current release.
-#define FIRMWARE_VERSION      "1.0.7"
+#define FIRMWARE_VERSION      "1.0.8"
 
 // OTA endpoints — served as static files from the same Replit host
 #define OTA_VERSION_URL       "https://vcon-gateway.replit.app/api/ota/version.txt"

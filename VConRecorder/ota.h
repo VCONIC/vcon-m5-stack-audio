@@ -38,6 +38,15 @@ inline void checkForOTA(Print& log) {
     remote.trim();
     http.end();
 
+    // Server may return plain "X.Y.Z" or JSON {"version":"X.Y.Z"}.
+    // Extract just the version token so the comparison is format-agnostic.
+    if (remote.startsWith("{")) {
+        int s = remote.indexOf('"', remote.indexOf(':') + 1);
+        int e = remote.indexOf('"', s + 1);
+        if (s >= 0 && e > s) remote = remote.substring(s + 1, e);
+        remote.trim();
+    }
+
     log.printf("[OTA] local=%s  remote=%s\n", FIRMWARE_VERSION, remote.c_str());
 
     if (remote == FIRMWARE_VERSION) {

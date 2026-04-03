@@ -2315,7 +2315,7 @@ void showLogoSplash() {
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(0x4A49u, TFT_BLACK);   // dim grey
     M5.Display.setCursor((SCREEN_W - 96) / 2, y + LOGO_H + 32);
-    M5.Display.print("vCon Recorder v1.0");
+    M5.Display.print("vCon Recorder v" FIRMWARE_VERSION);
 
     delay(10000);   // 10 seconds
 }
