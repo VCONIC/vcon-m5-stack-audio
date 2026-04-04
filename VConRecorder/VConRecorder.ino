@@ -152,7 +152,8 @@ enum UIScreen : uint8_t {
     SCREEN_STATUS   = 1,
     SCREEN_CONFIG   = 2,
     SCREEN_TOOLS    = 3,
-    SCREEN_DURATION = 4   // interactive duration picker
+    SCREEN_DURATION = 4,  // interactive duration picker
+    SCREEN_WIFI     = 5   // WiFi network picker
 };
 
 UIScreen currentScreen = SCREEN_HOME;
@@ -189,6 +190,47 @@ String     toolsResultLine2  = "";
 bool       toolsResultOK     = false;
 unsigned long toolsResultMs  = 0;
 const unsigned long TOOLS_RESULT_TIMEOUT_MS = 8000UL;
+
+// =============================================================================
+// WiFi picker state
+// =============================================================================
+
+enum WifiPhase : uint8_t {
+    WPHASE_SCANNING   = 0,
+    WPHASE_SELECT     = 1,
+    WPHASE_PASSWORD   = 2,
+    WPHASE_CONNECTING = 3,
+    WPHASE_RESULT     = 4
+};
+
+WifiPhase    wifiPhase        = WPHASE_SCANNING;
+
+// Scan results — kept in parallel arrays to avoid dynamic allocation
+#define WIFI_MAX_SCAN  20
+int          wifiScanCount    = 0;
+String       wifiScanSSID[WIFI_MAX_SCAN];
+int32_t      wifiScanRSSI[WIFI_MAX_SCAN];
+bool         wifiScanOpen[WIFI_MAX_SCAN];   // true = no password required
+uint8_t      wifiSelIdx       = 0;          // highlighted network in list
+uint8_t      wifiScrollTop    = 0;          // first visible index in list
+
+// Password character picker
+static const char WIFI_CHARS[] =
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    " !@#$%^&*()-_=+[]{}|;:',.<>?/~";
+#define WIFI_CHAR_COUNT  (sizeof(WIFI_CHARS) - 1)   // exclude null terminator
+// Special virtual indices after the character set
+#define WIFI_IDX_DONE   (WIFI_CHAR_COUNT)
+#define WIFI_IDX_DEL    (WIFI_CHAR_COUNT + 1)
+#define WIFI_IDX_TOTAL  (WIFI_CHAR_COUNT + 2)
+
+String       wifiPwdBuf       = "";         // password being composed
+uint16_t     wifiCharIdx      = 0;          // index into WIFI_CHARS + specials
+unsigned long wifiResultMs    = 0;
+bool         wifiResultOK     = false;
+String       wifiResultMsg    = "";
 
 // Wifi retry
 const unsigned long WIFI_RETRY_MS = 30000;
@@ -1641,8 +1683,8 @@ void drawConfigScreen() {
     }
 
     // Button row
-    drawButtonRow("HOME", "SET DUR", "--",
-                  VC_GREEN, VC_GREEN, TFT_DARKGREY);
+    drawButtonRow("HOME", "SET DUR", "WIFI",
+                  VC_GREEN, VC_GREEN, VC_GREEN);
 }
 
 // =============================================================================
@@ -1834,6 +1876,409 @@ void drawToolsScreen() {
 }
 
 // =============================================================================
+// UI: WiFi picker screen
+// =============================================================================
+
+// Run a WiFi scan and populate the wifiScan* arrays.
+void wifiRunScan() {
+    wifiScanCount = 0;
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    delay(100);
+    int n = WiFi.scanNetworks();
+    if (n > WIFI_MAX_SCAN) n = WIFI_MAX_SCAN;
+    for (int i = 0; i < n; i++) {
+        wifiScanSSID[i] = WiFi.SSID(i);
+        wifiScanRSSI[i] = WiFi.RSSI(i);
+        wifiScanOpen[i] = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+    }
+    WiFi.scanDelete();
+    wifiScanCount = n;
+    wifiSelIdx    = 0;
+    wifiScrollTop = 0;
+    Serial.printf("[wifi-picker] Scan found %d networks\n", n);
+}
+
+// Draw a small RSSI bar icon (4 bars) at (x, y), 20×10 px
+static void drawRSSIBars(int x, int y, int32_t rssi) {
+    // Map RSSI to 0–4 bars:  > -50 = 4,  > -60 = 3,  > -70 = 2,  > -80 = 1, else 0
+    int bars = 0;
+    if      (rssi > -50) bars = 4;
+    else if (rssi > -60) bars = 3;
+    else if (rssi > -70) bars = 2;
+    else if (rssi > -80) bars = 1;
+    for (int b = 0; b < 4; b++) {
+        int bh = 3 + b * 2;   // bar heights: 3, 5, 7, 9
+        int bx = x + b * 5;
+        uint16_t col = (b < bars) ? TFT_GREEN : 0x2104u;  // dark grey
+        M5.Display.fillRect(bx, y + (10 - bh), 4, bh, col);
+    }
+}
+
+void drawWifiScreen() {
+    // Header
+    M5.Display.fillRect(0, UI_CONTENT_Y, SCREEN_W, 14, VC_GREEN);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(TFT_BLACK, VC_GREEN);
+    M5.Display.setCursor(4, UI_CONTENT_Y + 3);
+    M5.Display.print("WIFI PICKER");
+    M5.Display.fillRect(0, UI_CONTENT_Y + 14, SCREEN_W, UI_CONTENT_H - 14, TFT_BLACK);
+
+    if (wifiPhase == WPHASE_SCANNING) {
+        M5.Display.setTextSize(2);
+        M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+        M5.Display.setCursor(60, 80);
+        M5.Display.print("Scanning...");
+        int dots = (millis() / 400) % 4;
+        M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.setCursor(60, 110);
+        for (int d = 0; d < dots; d++) M5.Display.print(". ");
+        drawButtonRow("--", "--", "--",
+                      TFT_DARKGREY, TFT_DARKGREY, TFT_DARKGREY);
+
+    } else if (wifiPhase == WPHASE_SELECT) {
+        if (wifiScanCount == 0) {
+            M5.Display.setTextSize(2);
+            M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+            M5.Display.setCursor(40, 70);
+            M5.Display.print("No networks");
+            M5.Display.setTextSize(1);
+            M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+            M5.Display.setCursor(40, 100);
+            M5.Display.print("Press SCAN to retry");
+            drawButtonRow("SCAN", "--", "BACK",
+                          VC_GREEN, TFT_DARKGREY, VC_GREEN);
+        } else {
+            // Show up to 5 networks at a time
+            const int visibleRows = 5;
+            const int rowH = 30;
+            int y = UI_CONTENT_Y + 16;
+
+            // Ensure selected item is visible
+            if (wifiSelIdx < wifiScrollTop) wifiScrollTop = wifiSelIdx;
+            if (wifiSelIdx >= wifiScrollTop + visibleRows)
+                wifiScrollTop = wifiSelIdx - visibleRows + 1;
+
+            int endIdx = wifiScrollTop + visibleRows;
+            if (endIdx > wifiScanCount) endIdx = wifiScanCount;
+
+            for (int i = wifiScrollTop; i < endIdx; i++) {
+                int ry = y + (i - wifiScrollTop) * rowH;
+                bool sel = (i == (int)wifiSelIdx);
+                uint16_t bg = sel ? 0x1082u : TFT_BLACK;
+                M5.Display.fillRect(0, ry, SCREEN_W, rowH - 1, bg);
+                if (sel) {
+                    M5.Display.fillRect(0, ry, 4, rowH - 1, VC_GREEN);
+                    M5.Display.drawRect(0, ry, SCREEN_W, rowH - 1, VC_GREEN);
+                }
+                // SSID (truncate to 26 chars)
+                M5.Display.setTextSize(1);
+                M5.Display.setTextColor(sel ? VC_GREEN : TFT_WHITE, bg);
+                M5.Display.setCursor(10, ry + 4);
+                String ssid = wifiScanSSID[i];
+                if (ssid.length() > 26) ssid = ssid.substring(0, 24) + "..";
+                M5.Display.print(ssid);
+                // Lock icon for secured networks
+                if (!wifiScanOpen[i]) {
+                    M5.Display.setTextColor(TFT_YELLOW, bg);
+                    M5.Display.setCursor(10, ry + 16);
+                    M5.Display.print("\xf0");  // lock-ish char
+                }
+                // RSSI bars
+                drawRSSIBars(SCREEN_W - 30, ry + 6, wifiScanRSSI[i]);
+                // dBm label
+                M5.Display.setTextSize(1);
+                M5.Display.setTextColor(TFT_DARKGREY, bg);
+                char rssiLabel[8];
+                snprintf(rssiLabel, sizeof(rssiLabel), "%d", (int)wifiScanRSSI[i]);
+                M5.Display.setCursor(SCREEN_W - 60, ry + 10);
+                M5.Display.print(rssiLabel);
+            }
+
+            // Scroll indicators
+            if (wifiScrollTop > 0) {
+                M5.Display.setTextColor(VC_GREEN, TFT_BLACK);
+                M5.Display.setCursor(SCREEN_W / 2 - 6, y - 2);
+                M5.Display.print("\x18");  // up arrow
+            }
+            if (endIdx < wifiScanCount) {
+                M5.Display.setTextColor(VC_GREEN, TFT_BLACK);
+                M5.Display.setCursor(SCREEN_W / 2 - 6, y + visibleRows * rowH);
+                M5.Display.print("\x19");  // down arrow
+            }
+
+            // Count indicator
+            M5.Display.setTextSize(1);
+            M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+            M5.Display.setCursor(SCREEN_W - 50, UI_CONTENT_Y + 3);
+            char countBuf[12];
+            snprintf(countBuf, sizeof(countBuf), "%d/%d", wifiSelIdx + 1, wifiScanCount);
+            M5.Display.print(countBuf);
+
+            drawButtonRow("PREV", "SELECT", "NEXT",
+                          VC_GREEN, TFT_GREEN, VC_GREEN);
+        }
+
+    } else if (wifiPhase == WPHASE_PASSWORD) {
+        // ── Network name ────────────────────────────────────────────────
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(VC_GREEN, TFT_BLACK);
+        M5.Display.setCursor(4, UI_CONTENT_Y + 18);
+        M5.Display.print("Network: ");
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        String ssidDisp = wifiScanSSID[wifiSelIdx];
+        if (ssidDisp.length() > 30) ssidDisp = ssidDisp.substring(0, 28) + "..";
+        M5.Display.print(ssidDisp);
+
+        // ── Password field ──────────────────────────────────────────────
+        M5.Display.setTextColor(VC_GREEN, TFT_BLACK);
+        M5.Display.setCursor(4, UI_CONTENT_Y + 34);
+        M5.Display.print("Password:");
+        // Show password with cursor
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+        M5.Display.setCursor(4, UI_CONTENT_Y + 48);
+        // Show last 38 chars of password if it gets long
+        String pwdShow = wifiPwdBuf;
+        if (pwdShow.length() > 38) pwdShow = ".." + pwdShow.substring(pwdShow.length() - 36);
+        M5.Display.print(pwdShow);
+        // Blinking cursor
+        if ((millis() / 500) % 2 == 0) {
+            M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+            M5.Display.print("_");
+        }
+
+        // ── Character picker ────────────────────────────────────────────
+        // Show current char large, with neighbours on each side
+        int cy = UI_CONTENT_Y + 72;
+        M5.Display.fillRect(0, cy, SCREEN_W, 50, 0x0841u);  // subtle bg band
+
+        // Neighbour chars (smaller, dimmed)
+        M5.Display.setTextSize(2);
+        for (int offset = -4; offset <= 4; offset++) {
+            if (offset == 0) continue;
+            int idx = ((int)wifiCharIdx + offset + WIFI_IDX_TOTAL) % WIFI_IDX_TOTAL;
+            int px = SCREEN_W / 2 + offset * 28;
+            if (px < 4 || px > SCREEN_W - 16) continue;
+            M5.Display.setTextColor(TFT_DARKGREY, 0x0841u);
+            M5.Display.setCursor(px - 6, cy + 16);
+            if (idx == (int)WIFI_IDX_DONE) {
+                M5.Display.setTextSize(1);
+                M5.Display.print("OK");
+                M5.Display.setTextSize(2);
+            } else if (idx == (int)WIFI_IDX_DEL) {
+                M5.Display.setTextSize(1);
+                M5.Display.print("DEL");
+                M5.Display.setTextSize(2);
+            } else {
+                M5.Display.print(WIFI_CHARS[idx]);
+            }
+        }
+
+        // Current char — large and bright
+        M5.Display.setTextSize(3);
+        int cx = SCREEN_W / 2 - 9;
+        if (wifiCharIdx == WIFI_IDX_DONE) {
+            M5.Display.setTextColor(TFT_GREEN, 0x0841u);
+            M5.Display.setCursor(cx - 18, cy + 10);
+            M5.Display.setTextSize(2);
+            M5.Display.print("[DONE]");
+        } else if (wifiCharIdx == WIFI_IDX_DEL) {
+            M5.Display.setTextColor(TFT_RED, 0x0841u);
+            M5.Display.setCursor(cx - 15, cy + 10);
+            M5.Display.setTextSize(2);
+            M5.Display.print("[DEL]");
+        } else {
+            M5.Display.setTextColor(TFT_WHITE, 0x0841u);
+            M5.Display.setCursor(cx, cy + 8);
+            M5.Display.print(WIFI_CHARS[wifiCharIdx]);
+        }
+
+        // ── Hint line ───────────────────────────────────────────────────
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        M5.Display.setCursor(10, UI_CONTENT_Y + 130);
+        M5.Display.printf("Len: %d  |  PREV/NEXT char, ADD to append", wifiPwdBuf.length());
+
+        // Category hint — show what region the char is in
+        M5.Display.setCursor(10, UI_CONTENT_Y + 144);
+        if (wifiCharIdx < 26) M5.Display.print("a-z lowercase");
+        else if (wifiCharIdx < 52) M5.Display.print("A-Z uppercase");
+        else if (wifiCharIdx < 62) M5.Display.print("0-9 digits");
+        else if (wifiCharIdx < WIFI_CHAR_COUNT) M5.Display.print("symbols");
+        else if (wifiCharIdx == WIFI_IDX_DONE) M5.Display.print("[DONE] = connect");
+        else if (wifiCharIdx == WIFI_IDX_DEL) M5.Display.print("[DEL] = delete last char");
+
+        drawButtonRow("PREV", "ADD", "NEXT",
+                      VC_GREEN, TFT_GREEN, VC_GREEN);
+
+    } else if (wifiPhase == WPHASE_CONNECTING) {
+        M5.Display.setTextSize(2);
+        M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+        M5.Display.setCursor(40, 70);
+        M5.Display.print("Connecting...");
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.setCursor(40, 100);
+        M5.Display.print(wifiScanSSID[wifiSelIdx]);
+        int dots = (millis() / 400) % 4;
+        M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+        M5.Display.setCursor(40, 120);
+        for (int d = 0; d < dots; d++) M5.Display.print(". ");
+        drawButtonRow("--", "--", "--",
+                      TFT_DARKGREY, TFT_DARKGREY, TFT_DARKGREY);
+
+    } else {  // WPHASE_RESULT
+        M5.Display.setTextSize(2);
+        uint16_t resCol = wifiResultOK ? TFT_GREEN : TFT_RED;
+        M5.Display.setTextColor(resCol, TFT_BLACK);
+        M5.Display.setCursor(20, 50);
+        M5.Display.print(wifiResultOK ? "CONNECTED" : "FAILED");
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.setCursor(20, 80);
+        M5.Display.print(wifiResultMsg);
+        if (wifiResultOK) {
+            M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+            M5.Display.setCursor(20, 100);
+            M5.Display.print("IP: ");
+            M5.Display.print(WiFi.localIP().toString());
+            M5.Display.setCursor(20, 116);
+            M5.Display.printf("RSSI: %d dBm", wifiRSSI);
+        }
+        // Auto-return timer bar
+        unsigned long elapsed = millis() - wifiResultMs;
+        if (elapsed < TOOLS_RESULT_TIMEOUT_MS) {
+            float frac = (float)elapsed / (float)TOOLS_RESULT_TIMEOUT_MS;
+            int barW = (int)((1.0f - frac) * (SCREEN_W - 20));
+            M5.Display.fillRect(10, 140, barW, 3, resCol);
+        }
+        drawButtonRow("SCAN", "--", "HOME",
+                      VC_GREEN, TFT_DARKGREY, VC_GREEN);
+    }
+}
+
+// =============================================================================
+// WiFi picker: connect to selected network
+// =============================================================================
+
+void wifiPickerConnect() {
+    String selectedSSID = wifiScanSSID[wifiSelIdx];
+    String selectedPass = wifiScanOpen[wifiSelIdx] ? "" : wifiPwdBuf;
+
+    // Save to globals + flash
+    wifiSSID     = selectedSSID;
+    wifiPassword = selectedPass;
+    saveConfig();
+    Serial.printf("[wifi-picker] Saved: SSID=%s\n", wifiSSID.c_str());
+
+    // Attempt connection
+    connectWiFi();
+
+    if (wifiConnected) {
+        wifiResultOK  = true;
+        wifiResultMsg = "Saved: " + wifiSSID;
+        initNTP();
+    } else {
+        wifiResultOK  = false;
+        wifiResultMsg = "Could not connect to " + selectedSSID;
+    }
+    wifiPhase    = WPHASE_RESULT;
+    wifiResultMs = millis();
+}
+
+// =============================================================================
+// WiFi picker: button handling
+// =============================================================================
+
+void handleWifiButtons() {
+    switch (wifiPhase) {
+    case WPHASE_SCANNING:
+        // No input while scanning
+        break;
+
+    case WPHASE_SELECT:
+        if (wifiScanCount == 0) {
+            // No networks: SCAN or BACK
+            if (M5.BtnA.wasPressed()) {
+                wifiPhase = WPHASE_SCANNING;  // re-scan triggered in loop()
+            }
+            if (M5.BtnC.wasPressed()) {
+                currentScreen = SCREEN_CONFIG;
+            }
+        } else {
+            if (M5.BtnA.wasPressed()) {
+                // PREV
+                if (wifiSelIdx > 0) wifiSelIdx--;
+                else wifiSelIdx = wifiScanCount - 1;
+            }
+            if (M5.BtnC.wasPressed()) {
+                // NEXT
+                wifiSelIdx = (wifiSelIdx + 1) % wifiScanCount;
+            }
+            if (M5.BtnB.wasPressed()) {
+                // SELECT — open networks skip password
+                if (wifiScanOpen[wifiSelIdx]) {
+                    wifiPwdBuf = "";
+                    wifiPhase  = WPHASE_CONNECTING;
+                } else {
+                    wifiPwdBuf  = "";
+                    wifiCharIdx = 0;
+                    wifiPhase   = WPHASE_PASSWORD;
+                }
+            }
+        }
+        break;
+
+    case WPHASE_PASSWORD:
+        if (M5.BtnA.wasPressed()) {
+            // PREV char
+            if (wifiCharIdx == 0) wifiCharIdx = WIFI_IDX_TOTAL - 1;
+            else wifiCharIdx--;
+        }
+        if (M5.BtnC.wasPressed()) {
+            // NEXT char
+            wifiCharIdx = (wifiCharIdx + 1) % WIFI_IDX_TOTAL;
+        }
+        if (M5.BtnB.wasPressed()) {
+            // ADD / action
+            if (wifiCharIdx == WIFI_IDX_DONE) {
+                // Done — connect
+                wifiPhase = WPHASE_CONNECTING;
+            } else if (wifiCharIdx == WIFI_IDX_DEL) {
+                // Delete last char
+                if (wifiPwdBuf.length() > 0)
+                    wifiPwdBuf.remove(wifiPwdBuf.length() - 1);
+            } else {
+                // Append character
+                if (wifiPwdBuf.length() < 63)  // WPA max = 63 chars
+                    wifiPwdBuf += WIFI_CHARS[wifiCharIdx];
+            }
+        }
+        break;
+
+    case WPHASE_CONNECTING:
+        // No input while connecting
+        break;
+
+    case WPHASE_RESULT:
+        if (M5.BtnA.wasPressed()) {
+            // SCAN again
+            wifiPhase = WPHASE_SCANNING;
+        }
+        if (M5.BtnC.wasPressed()) {
+            currentScreen = SCREEN_HOME;
+        }
+        if ((millis() - wifiResultMs) > TOOLS_RESULT_TIMEOUT_MS) {
+            currentScreen = SCREEN_CONFIG;
+        }
+        break;
+    }
+}
+
+// =============================================================================
 // UI: Full UI redraw dispatcher
 // =============================================================================
 
@@ -1846,6 +2291,7 @@ void updateDisplay() {
         case SCREEN_CONFIG:   drawConfigScreen();   break;
         case SCREEN_TOOLS:    drawToolsScreen();    break;
         case SCREEN_DURATION: drawDurationScreen(); break;
+        case SCREEN_WIFI:     drawWifiScreen();     break;
     }
     M5.Display.endWrite();
 }
@@ -2091,6 +2537,10 @@ void handleButtons() {
             durEditPending = recordDurationSec;   // seed picker with live value
             currentScreen  = SCREEN_DURATION;
         }
+        if (M5.BtnC.wasPressed()) {
+            wifiPhase     = WPHASE_SCANNING;
+            currentScreen = SCREEN_WIFI;
+        }
         break;
 
     case SCREEN_DURATION:
@@ -2130,6 +2580,10 @@ void handleButtons() {
 
     case SCREEN_TOOLS:
         handleToolsButtons();
+        break;
+
+    case SCREEN_WIFI:
+        handleWifiButtons();
         break;
     }
 }
@@ -2461,6 +2915,18 @@ void loop() {
     // ---- TOOLS execution — run selected tool when phase is RUNNING ----------
     if (currentScreen == SCREEN_TOOLS && toolsPhase == TPHASE_RUNNING) {
         toolsRunSelected();
+    }
+
+    // ---- WIFI picker execution — blocking scan / connect phases ----------
+    if (currentScreen == SCREEN_WIFI) {
+        if (wifiPhase == WPHASE_SCANNING) {
+            updateDisplay();   // show "Scanning..." before blocking call
+            wifiRunScan();
+            wifiPhase = WPHASE_SELECT;
+        } else if (wifiPhase == WPHASE_CONNECTING) {
+            updateDisplay();   // show "Connecting..." before blocking call
+            wifiPickerConnect();
+        }
     }
 
     // ---- Button handling ------------------------------------------------
