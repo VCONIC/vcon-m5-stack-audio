@@ -575,6 +575,8 @@ Within each upload:
 
 ## 9. Build & Flash
 
+> **Using Claude Code?** The repo includes a `flash-controller` skill that handles the full workflow automatically — port discovery, version check, compile (on request), flash, and boot verification. Just say *"flash the device"* or *"update the M5"*.
+
 ### Prerequisites
 
 - **Arduino IDE 2.x** (includes arduino-cli at a known path on macOS)

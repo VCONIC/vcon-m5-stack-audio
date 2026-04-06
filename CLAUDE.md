@@ -58,6 +58,18 @@ arduino-cli upload \
 - **M5Unified** library v0.2.13+
 - Partition scheme: **Minimal SPIFFS (1.9 MB APP with OTA)** — required for OTA
 
+## Claude Code Skills
+
+The repo ships a custom Claude Code skill for device workflows:
+
+| Skill | Trigger phrase | What it does |
+|---|---|---|
+| `flash-controller` | *"flash the device"*, *"update the M5"*, *"reflash"* | Auto-discovers the USB serial port, reads the running firmware version via `status` serial command, compares against `config.h`, compiles if asked, flashes the pre-built binary, and verifies the new version boots correctly |
+
+Skill definition: `.claude/skills/flash-controller/SKILL.md`
+
+> **Note for contributors:** `.claude/settings.local.json` is gitignored — it holds machine-specific tool permissions accumulated during your Claude Code sessions and should not be committed.
+
 ## Architecture
 
 ### Single-file sketch
