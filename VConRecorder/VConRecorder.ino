@@ -208,7 +208,7 @@ WifiPhase    wifiPhase        = WPHASE_SCANNING;
 // Scan results — kept in parallel arrays to avoid dynamic allocation
 #define WIFI_MAX_SCAN  20
 int          wifiScanCount    = 0;
-String       wifiScanSSID[WIFI_MAX_SCAN];
+char         wifiScanSSID[WIFI_MAX_SCAN][33]; // 32-byte SSID max + null
 int32_t      wifiScanRSSI[WIFI_MAX_SCAN];
 bool         wifiScanOpen[WIFI_MAX_SCAN];   // true = no password required
 uint8_t      wifiSelIdx       = 0;          // highlighted network in list
@@ -231,6 +231,7 @@ uint16_t     wifiCharIdx      = 0;          // index into WIFI_CHARS + specials
 unsigned long wifiResultMs    = 0;
 bool         wifiResultOK     = false;
 String       wifiResultMsg    = "";
+bool         wifiWasConnected = false;      // WiFi state captured on picker entry
 
 // Wifi retry
 const unsigned long WIFI_RETRY_MS = 30000;
@@ -1890,7 +1891,8 @@ void wifiRunScan() {
     int n = WiFi.scanNetworks();
     if (n > WIFI_MAX_SCAN) n = WIFI_MAX_SCAN;
     for (int i = 0; i < n; i++) {
-        wifiScanSSID[i] = WiFi.SSID(i);
+        strncpy(wifiScanSSID[i], WiFi.SSID(i).c_str(), 32);
+        wifiScanSSID[i][32] = '\0';
         wifiScanRSSI[i] = WiFi.RSSI(i);
         wifiScanOpen[i] = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
     }
@@ -2017,7 +2019,7 @@ void drawWifiScreen() {
             snprintf(countBuf, sizeof(countBuf), "%d/%d", wifiSelIdx + 1, wifiScanCount);
             M5.Display.print(countBuf);
 
-            drawButtonRow("PREV", "SELECT", "NEXT",
+            drawButtonRow("BACK", "SELECT", "NEXT",
                           VC_GREEN, TFT_GREEN, VC_GREEN);
         }
 
@@ -2193,6 +2195,17 @@ void wifiPickerConnect() {
 // WiFi picker: button handling
 // =============================================================================
 
+// Exit the WiFi picker to dest screen.  If WiFi was up when we entered but
+// is now down (scan tore it down and no new connection was made), reset
+// lastWifiCheckMs so checkWiFi() retries immediately on the next loop tick
+// instead of waiting up to WIFI_RETRY_MS.
+static void exitWifiPicker(UIScreen dest) {
+    if (wifiWasConnected && !wifiConnected) {
+        lastWifiCheckMs = 0;
+    }
+    currentScreen = dest;
+}
+
 void handleWifiButtons() {
     switch (wifiPhase) {
     case WPHASE_SCANNING:
@@ -2206,16 +2219,15 @@ void handleWifiButtons() {
                 wifiPhase = WPHASE_SCANNING;  // re-scan triggered in loop()
             }
             if (M5.BtnC.wasPressed()) {
-                currentScreen = SCREEN_CONFIG;
+                exitWifiPicker(SCREEN_CONFIG);
             }
         } else {
             if (M5.BtnA.wasPressed()) {
-                // PREV
-                if (wifiSelIdx > 0) wifiSelIdx--;
-                else wifiSelIdx = wifiScanCount - 1;
+                // BACK — return to config without connecting
+                exitWifiPicker(SCREEN_CONFIG);
             }
             if (M5.BtnC.wasPressed()) {
-                // NEXT
+                // NEXT (wraps, so all networks reachable without PREV)
                 wifiSelIdx = (wifiSelIdx + 1) % wifiScanCount;
             }
             if (M5.BtnB.wasPressed()) {
@@ -2269,10 +2281,10 @@ void handleWifiButtons() {
             wifiPhase = WPHASE_SCANNING;
         }
         if (M5.BtnC.wasPressed()) {
-            currentScreen = SCREEN_HOME;
+            exitWifiPicker(SCREEN_HOME);
         }
         if ((millis() - wifiResultMs) > TOOLS_RESULT_TIMEOUT_MS) {
-            currentScreen = SCREEN_CONFIG;
+            exitWifiPicker(SCREEN_CONFIG);
         }
         break;
     }
@@ -2538,8 +2550,9 @@ void handleButtons() {
             currentScreen  = SCREEN_DURATION;
         }
         if (M5.BtnC.wasPressed()) {
-            wifiPhase     = WPHASE_SCANNING;
-            currentScreen = SCREEN_WIFI;
+            wifiWasConnected = wifiConnected;
+            wifiPhase        = WPHASE_SCANNING;
+            currentScreen    = SCREEN_WIFI;
         }
         break;
 
