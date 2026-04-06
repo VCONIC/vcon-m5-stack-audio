@@ -65,8 +65,9 @@ The repo ships a custom Claude Code skill for device workflows:
 | Skill | Trigger phrase | What it does |
 |---|---|---|
 | `flash-controller` | *"flash the device"*, *"update the M5"*, *"reflash"* | Auto-discovers the USB serial port, reads the running firmware version via `status` serial command, compares against `config.h`, compiles if asked, flashes the pre-built binary, and verifies the new version boots correctly |
+| `release-firmware` | *"release"*, *"cut a release"*, *"bump and deploy"* | Increments `FIRMWARE_VERSION` in `config.h` (patch by default; say "minor" or "major" to override), compiles, commits + pushes to git, then — after explicit confirmation — authenticates with the OTA gateway and deploys the binary and version string in the correct order |
 
-Skill definition: `.claude/skills/flash-controller/SKILL.md`
+Skill definitions: `.claude/skills/flash-controller/SKILL.md`, `.claude/skills/release-firmware/SKILL.md`
 
 > **Note for contributors:** `.claude/settings.local.json` is gitignored — it holds machine-specific tool permissions accumulated during your Claude Code sessions and should not be committed.
 
