@@ -85,7 +85,7 @@ All large buffers are allocated in **PSRAM** (8 MB external, ~4 MB usable). Key 
 
 ### UI system
 
-Four-screen touch navigation with a shared top hazard strip and bottom button row:
+Four main screens plus a DURATION sub-screen, all sharing a top hazard strip and bottom button row:
 - **HOME** — connection status, state, stats
 - **STATUS** — real-time VU meter, upload progress
 - **CONFIG** — read-only settings display
