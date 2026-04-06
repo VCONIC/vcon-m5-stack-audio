@@ -18,6 +18,15 @@
 #define DEFAULT_WIFI_SSID     "barnhill tavern"
 #define DEFAULT_WIFI_PASSWORD "meteormeteor"
 
+// Static IP — set WIFI_STATIC_IP_ENABLE to 1 to bypass DHCP.
+// Set to 0 (or comment out) to use DHCP instead.
+// Useful for APs with unreliable DHCP servers.
+#define WIFI_STATIC_IP_ENABLE  1
+#define WIFI_STATIC_IP         "192.168.1.200"
+#define WIFI_STATIC_GW         "192.168.1.1"
+#define WIFI_STATIC_SUBNET     "255.255.255.0"
+#define WIFI_STATIC_DNS        "8.8.8.8"
+
 // vCon POST endpoint default
 #define DEFAULT_POST_URL      "https://vcon-gateway.replit.app/ingress"
 

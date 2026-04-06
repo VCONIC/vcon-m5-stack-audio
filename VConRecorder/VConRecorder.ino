@@ -315,12 +315,26 @@ void connectWiFi() {
     WiFi.mode(WIFI_OFF);
     delay(200);
     WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(false);
+    WiFi.setAutoReconnect(true);
     delay(100);
-    WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+    // Static IP — only applied when WIFI_STATIC_IP_ENABLE is 1 in config.h.
+    // Set to 0 to use DHCP instead.
+#if WIFI_STATIC_IP_ENABLE
+    {
+        IPAddress ip, gw, sn, dns;
+        ip.fromString(WIFI_STATIC_IP);
+        gw.fromString(WIFI_STATIC_GW);
+        sn.fromString(WIFI_STATIC_SUBNET);
+        dns.fromString(WIFI_STATIC_DNS);
+        WiFi.config(ip, gw, sn, dns);
+        Serial.printf("[wifi] Using static IP %s\n", WIFI_STATIC_IP);
+    }
+#endif
+    wl_status_t rc = WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+    Serial.printf("[wifi] begin() returned %d\n", rc);
     for (int i = 0; i < 30 && WiFi.status() != WL_CONNECTED; i++) {
         delay(500);
-        M5.update();
+        if (i % 5 == 0) Serial.printf("[wifi] poll %d status=%d\n", i, WiFi.status());
     }
     wifiConnected = (WiFi.status() == WL_CONNECTED);
     if (wifiConnected) {
@@ -329,7 +343,8 @@ void connectWiFi() {
                       WiFi.localIP().toString().c_str(), wifiRSSI);
         lastStatus = "WiFi connected";
     } else {
-        Serial.println("[wifi] Connection FAILED");
+        Serial.printf("[wifi] Connection FAILED (status=%d, ssid_len=%d, pass_len=%d)\n",
+                      WiFi.status(), wifiSSID.length(), wifiPassword.length());
         lastStatus = "WiFi failed — use 'wifi' command";
     }
 }
