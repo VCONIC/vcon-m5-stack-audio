@@ -22,3 +22,6 @@ VConRecorder/build/*.map
 # Editor
 .vscode/
 *.swp
+
+# Claude Code — local permissions/settings (machine-specific, not for version control)
+.claude/settings.local.json
