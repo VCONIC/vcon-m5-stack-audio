@@ -4,7 +4,7 @@ description: Increment version, compile, commit, push, and deploy firmware to th
 allowed-tools: Bash, Read, Edit
 ---
 
-Perform a full firmware release for the M5Stack Core2 vCon Recorder. Follow these steps in order.
+Perform a full firmware release for the M5Stack vCon Recorder (Core2 and CoreS3). Follow these steps in order.
 
 ## 1. Determine the version bump
 
@@ -32,28 +32,38 @@ Edit `VConRecorder/config.h` — replace the `FIRMWARE_VERSION` line only:
 
 Do not change anything else in the file.
 
-## 3. Compile
+## 3. Compile both board variants
+
+Build for **both** Core2 and CoreS3:
 
 ```bash
+# Core2
 /opt/homebrew/bin/arduino-cli compile \
   --fqbn esp32:esp32:m5stack_core2 \
-  --output-dir VConRecorder/build \
+  --build-property "build.partitions=min_spiffs" \
+  --build-property "upload.maximum_size=1966080" \
+  --output-dir VConRecorder/build/esp32.esp32.m5stack_core2 \
+  VConRecorder
+
+# CoreS3
+/opt/homebrew/bin/arduino-cli compile \
+  --fqbn esp32:esp32:m5stack_cores3 \
+  --build-property "build.partitions=min_spiffs" \
+  --build-property "upload.maximum_size=1966080" \
+  --output-dir VConRecorder/build/esp32.esp32.m5stack_cores3 \
   VConRecorder
 ```
 
-Show the sketch size output. If compilation fails, stop and report the error — do not proceed.
-
-The firmware binary will be at:
-```
-VConRecorder/build/esp32.esp32.m5stack_core2/firmware.bin
-```
+Show the sketch size output for both. If either compilation fails, stop and report the error — do not proceed.
 
 ## 4. Commit and push to git
 
-Stage and commit both the updated `config.h` and the new `firmware.bin`:
+Stage and commit the updated config and both firmware binaries:
 
 ```bash
-git add VConRecorder/config.h VConRecorder/build/esp32.esp32.m5stack_core2/firmware.bin
+git add VConRecorder/config.h \
+       VConRecorder/build/esp32.esp32.m5stack_core2/firmware.bin \
+       VConRecorder/build/esp32.esp32.m5stack_cores3/firmware.bin
 git commit -m "release: firmware v<NEW_VERSION>"
 git push
 ```
@@ -66,9 +76,11 @@ Show the commit hash and confirm the push succeeded.
 
 ```
 Ready to deploy to OTA server:
-  Binary:   VConRecorder/build/esp32.esp32.m5stack_core2/firmware.bin
-  Version:  <NEW_VERSION>
-  Endpoint: https://vcon-gateway.replit.app/api/ota/
+  Core2 binary:  VConRecorder/build/esp32.esp32.m5stack_core2/firmware.bin
+  CoreS3 binary: VConRecorder/build/esp32.esp32.m5stack_cores3/firmware.bin
+  Version:       <NEW_VERSION>
+  Endpoints:     https://vcon-gateway.replit.app/api/ota/core2/
+                 https://vcon-gateway.replit.app/api/ota/cores3/
 
 Deploy order: firmware.bin is uploaded BEFORE version.txt is updated.
 If you deploy version.txt first, devices will attempt to download a
@@ -77,7 +89,7 @@ mismatched binary and get stuck in a boot loop.
 Proceed with OTA deploy? (yes / no)
 ```
 
-Wait for explicit confirmation. If the user says no, stop — the git commit is already done and the binary can be deployed manually later.
+Wait for explicit confirmation. If the user says no, stop — the git commit is already done and the binaries can be deployed manually later.
 
 ## 6. Get OTA credentials
 
@@ -99,15 +111,16 @@ echo "Token acquired: ${TOKEN:0:20}..."
 
 If the token is empty or the login fails, stop and report the error.
 
-## 7. Upload the firmware binary
+## 7. Upload firmware binaries
 
-Upload via base64-encoded JSON body — do NOT use `base64 -w0` (Linux-only flag):
+Upload **both** board variants. Do NOT use `base64 -w0` (Linux-only flag):
 
 ```bash
-python3 - <<PYEOF
+for BOARD in core2 cores3; do
+  python3 - <<PYEOF
 import base64, json, urllib.request, os
 
-binary_path = "VConRecorder/build/esp32.esp32.m5stack_core2/firmware.bin"
+binary_path = f"VConRecorder/build/esp32.esp32.m5stack_{os.environ['BOARD']}/firmware.bin"
 token = os.environ.get("OTA_TOKEN", "")
 
 with open(binary_path, "rb") as f:
@@ -115,54 +128,63 @@ with open(binary_path, "rb") as f:
 
 payload = json.dumps({"firmwareBase64": data}).encode("utf-8")
 req = urllib.request.Request(
-    "https://vcon-gateway.replit.app/api/ota/firmware",
+    f"https://vcon-gateway.replit.app/api/ota/{os.environ['BOARD']}/firmware",
     data=payload,
     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     method="POST"
 )
 try:
     with urllib.request.urlopen(req, timeout=120) as resp:
-        print("Upload OK:", resp.read().decode())
+        print(f"{os.environ['BOARD']} upload OK:", resp.read().decode())
 except Exception as e:
-    print("Upload FAILED:", e)
+    print(f"{os.environ['BOARD']} upload FAILED:", e)
     raise SystemExit(1)
 PYEOF
+done
 ```
 
-Pass the token via environment variable:
+Pass variables via environment:
 ```bash
-OTA_TOKEN="$TOKEN" python3 - <<PYEOF
-... (script above)
-PYEOF
+OTA_TOKEN="$TOKEN" BOARD="core2" python3 - <<PYEOF ... PYEOF
+OTA_TOKEN="$TOKEN" BOARD="cores3" python3 - <<PYEOF ... PYEOF
 ```
 
-If the upload fails, stop — do NOT update the version string.
+If either upload fails, stop — do NOT update the version strings.
 
-## 8. Set the version string
+## 8. Set the version strings
 
-Only after the binary upload succeeds:
+Only after **both** binary uploads succeed:
 
 ```bash
-curl -s -X PUT https://vcon-gateway.replit.app/api/ota/version \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"version\":\"<NEW_VERSION>\"}"
+for BOARD in core2 cores3; do
+  curl -s -X PUT "https://vcon-gateway.replit.app/api/ota/$BOARD/version" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"version\":\"<NEW_VERSION>\"}"
+done
 ```
 
 ## 9. Verify
 
-Confirm both endpoints return the expected values (no auth required):
+Confirm all endpoints return the expected values (no auth required):
 
 ```bash
-echo "Version:" && curl -s https://vcon-gateway.replit.app/api/ota/version.txt
-echo "Binary size:" && curl -sI https://vcon-gateway.replit.app/api/ota/firmware.bin \
-  | grep -i content-length
+for BOARD in core2 cores3; do
+  echo "=== $BOARD ==="
+  echo "Version:" && curl -s "https://vcon-gateway.replit.app/api/ota/$BOARD/version.txt"
+  echo "Binary size:" && curl -sI "https://vcon-gateway.replit.app/api/ota/$BOARD/firmware.bin" \
+    | grep -i content-length
+done
 ```
 
 Report the results. A successful release looks like:
 ```
+=== core2 ===
 Version: 1.0.9
 Binary size: content-length: 1425408
+=== cores3 ===
+Version: 1.0.9
+Binary size: content-length: 1512960
 ```
 
 ---
@@ -170,10 +192,11 @@ Binary size: content-length: 1425408
 ## Key facts
 
 - **arduino-cli path:** `/opt/homebrew/bin/arduino-cli` (not in PATH)
-- **FQBN:** `esp32:esp32:m5stack_core2`
+- **Supported boards:** Core2 (`esp32:esp32:m5stack_core2`) and CoreS3 (`esp32:esp32:m5stack_cores3`)
 - **config.h path:** `VConRecorder/config.h`
-- **Firmware binary:** `VConRecorder/build/esp32.esp32.m5stack_core2/firmware.bin`
-- **OTA base URL:** `https://vcon-gateway.replit.app/api/ota/`
-- **Deploy order is critical:** binary upload BEFORE version string update
+- **Firmware binaries:** `VConRecorder/build/esp32.esp32.m5stack_<board>/firmware.bin`
+- **OTA base URLs:** `https://vcon-gateway.replit.app/api/ota/core2/` and `.../cores3/`
+- **Deploy order is critical:** binary upload BEFORE version string update, for BOTH boards
 - **Do not use `base64 -w0`** — that flag is Linux-only; use Python for encoding on macOS
 - **Do not store credentials** in any file — ask each session
+- **Both boards share the same FIRMWARE_VERSION** — they are built from the same source

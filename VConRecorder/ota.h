@@ -19,6 +19,7 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include "config.h"
+#include "hardware.h"
 
 inline void checkForOTA(Print& log) {
     HTTPClient http;
