@@ -1,0 +1,57 @@
+{
+  "schema_version": "1.0.0",
+  "repo": "vcon-m5-stack-audio",
+  "repo_version": null,
+  "archetype": "firmware",
+  "generated_at": "2026-04-16T15:15:48.656122+00:00",
+  "stats": {
+    "node_count": 7,
+    "edge_count": 0
+  },
+  "nodes": [
+    {
+      "id": "component:config",
+      "type": "component",
+      "name": "config",
+      "file": "VConRecorder/config.h"
+    },
+    {
+      "id": "component:logo",
+      "type": "component",
+      "name": "logo",
+      "file": "VConRecorder/logo.h"
+    },
+    {
+      "id": "component:ota",
+      "type": "component",
+      "name": "ota",
+      "file": "VConRecorder/ota.h"
+    },
+    {
+      "id": "component:VConRecorder",
+      "type": "component",
+      "name": "VConRecorder",
+      "file": "VConRecorder/VConRecorder.ino"
+    },
+    {
+      "id": "task:uploadTaskFn",
+      "type": "task",
+      "name": "uploadTaskFn",
+      "file": "VConRecorder/VConRecorder.ino"
+    },
+    {
+      "id": "document:readme-md",
+      "type": "document",
+      "name": "README.md",
+      "file": "README.md"
+    },
+    {
+      "id": "document:claude-md",
+      "type": "document",
+      "name": "CLAUDE.md",
+      "file": "CLAUDE.md"
+    }
+  ],
+  "edges": [],
+  "subsystems": []
+}
