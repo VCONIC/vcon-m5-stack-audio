@@ -21,7 +21,7 @@
 // Static IP — set WIFI_STATIC_IP_ENABLE to 1 to bypass DHCP.
 // Set to 0 (or comment out) to use DHCP instead.
 // Useful for APs with unreliable DHCP servers.
-#define WIFI_STATIC_IP_ENABLE  1
+#define WIFI_STATIC_IP_ENABLE  0
 #define WIFI_STATIC_IP         "192.168.1.200"
 #define WIFI_STATIC_GW         "192.168.1.1"
 #define WIFI_STATIC_SUBNET     "255.255.255.0"
@@ -52,7 +52,7 @@
 // Stored in flash (Preferences key "rec_dur") and survives power cycles.
 #define RECORD_DURATION_SEC     45   // default: 45 s per chunk (continuous mode)
 #define MIN_RECORD_DURATION_SEC 10   // shortest allowed (codec settle overhead)
-#define MAX_RECORD_DURATION_SEC 120  // longest allowed (PSRAM budget; see note below)
+#define MAX_RECORD_DURATION_SEC 3600 // longest allowed (SD-streaming for >45 s)
 
 // Continuous dual-buffer mode requires two full PCM buffers in PSRAM simultaneously.
 // At 60 s the two PCM buffers (2 × 960 KB) consume ~1.92 MB, leaving only ~2.1 MB
@@ -74,6 +74,23 @@
 //   Continuous peak   : D × 69.3 KB   →  60 s ≈ 4.2 MB  ✓  > 60 s exceeds ~4 MB  ✗
 //
 // Core2 has 8 MB PSRAM; ~4–5 MB is available after IDF/WiFi/mbedtls overhead.
+
+// SD-streaming mode — records directly to SD card, bypassing PSRAM audio
+// buffers entirely.  Removes the PSRAM-imposed duration ceiling and supports
+// up to SD_STREAM_MAX_DURATION_SEC.  Activates automatically when
+// recordDurationSec > CONT_MAX_DURATION_SEC, or when forced via serial cmd.
+#define SD_STREAM_MAX_DURATION_SEC  3600  // 60 minutes
+
+// MP3 compression — requires libshine library.
+// Set to 1 to compile in the MP3 encoder.  Runtime toggle via 'mp3 on/off'
+// serial command (persisted to flash).
+#define ENABLE_MP3              1
+#define MP3_BITRATE_KBPS        32    // 32 kbps CBR, good for 8 kHz mono voice
+
+// SD-streaming buffer sizes
+#define SD_WRITE_BUF_SIZE       4096  // bytes per SD write
+#define B64_RAW_CHUNK_SIZE      3072  // must be divisible by 3 for clean base64
+#define B64_ENC_CHUNK_SIZE      4096  // B64_RAW_CHUNK_SIZE * 4/3
 
 // Display (M5Stack Core2 built-in LCD)
 #define SCREEN_W  320
