@@ -33,6 +33,7 @@
 #include <SD.h>
 #include "config.h"
 #include "hardware.h"
+#include "shine_mp3.h"
 #include "logo.h"
 #include "ota.h"
 
@@ -149,6 +150,29 @@ struct UploadJob {
 static UploadJob g_uploadJob;
 TaskHandle_t     g_uploadTaskHandle = nullptr;
 
+// =============================================================================
+// SD-streaming mode — record directly to SD card, bypassing PSRAM buffers.
+// =============================================================================
+// Activated when recordDurationSec > CONT_MAX_DURATION_SEC or forced via
+// serial command.  Audio is written to SD as PCM WAV (or MP3 when enabled)
+// in real time.  Upload reads back from SD using VConStream (Phase 3).
+
+bool     sdStreamMode    = false;   // true → recording to SD (vs PSRAM)
+bool     sdStreamForce   = false;   // user override via serial "sdstream on"
+bool     useMp3          = false;   // runtime toggle: MP3 vs WAV for SD-stream
+File     sdRecFile;                 // open SD file during SD-stream recording
+char     sdRecPath[120];            // full path to current recording file
+char     sdRecUUID[37];             // UUID for current SD-stream recording
+uint32_t sdRecSamples    = 0;       // PCM samples written so far
+uint32_t sdRecBytes      = 0;       // bytes written to SD file (differs for MP3)
+
+#if ENABLE_MP3
+static shine_t  mp3Enc          = nullptr;
+static int      mp3SamplesPerFrame = 0;  // set at runtime via shine_samples_per_pass()
+static int16_t  mp3AccumBuf[SHINE_MAX_SAMPLES]; // frame accumulator (max 1152)
+static uint16_t mp3AccumCount   = 0;
+#endif
+
 // Audio level history — 16 bars for the VU-meter display
 #define LEVEL_BARS 16
 int      levelHistory[LEVEL_BARS] = {0};
@@ -210,6 +234,8 @@ enum UIScreen : uint8_t {
 };
 
 UIScreen currentScreen = SCREEN_HOME;
+
+static void exitWifiPicker(UIScreen dest);
 
 // Inactivity timer — return to HOME after 60 s without a button press
 unsigned long lastButtonMs           = 0;
@@ -325,6 +351,9 @@ void loadConfig() {
     totalUploads      = prefs.getUInt("total_up", 0);
     failedUploads     = prefs.getUInt("fail_up",  0);
     recordDurationSec = prefs.getUInt("rec_dur",  RECORD_DURATION_SEC);
+#if ENABLE_MP3
+    useMp3            = prefs.getBool("use_mp3",  false);
+#endif
     prefs.end();
     // Clamp in case a previously stored value is out of range
     if (recordDurationSec < MIN_RECORD_DURATION_SEC) recordDurationSec = MIN_RECORD_DURATION_SEC;
@@ -332,6 +361,9 @@ void loadConfig() {
     Serial.printf("[config] SSID=%s\n[config] URL=%s\n",
                   wifiSSID.c_str(), postURL.c_str());
     Serial.printf("[config] Duration=%u s\n", recordDurationSec);
+#if ENABLE_MP3
+    Serial.printf("[config] MP3=%s\n", useMp3 ? "on" : "off");
+#endif
     if (deviceToken.length() > 0)
         Serial.printf("[config] Token=%s\n", deviceToken.c_str());
 }
@@ -345,6 +377,9 @@ void saveConfig() {
     prefs.putUInt("total_up",  totalUploads);
     prefs.putUInt("fail_up",   failedUploads);
     prefs.putUInt("rec_dur",   recordDurationSec);
+#if ENABLE_MP3
+    prefs.putBool("use_mp3",  useMp3);
+#endif
     prefs.end();
 }
 
@@ -854,8 +889,144 @@ bool allocateContinuousBuffers() {
     return true;
 }
 
+// =============================================================================
+// SD-streaming helpers
+// =============================================================================
+
+// Decide whether to use SD-streaming for the current recording.
+bool shouldUseSdStream() {
+    return sdStreamForce || (recordDurationSec > CONT_MAX_DURATION_SEC);
+}
+
+// Open a new SD file for streaming audio.  Sets sdRecPath, sdRecUUID,
+// resets counters.  Returns true on success.
+bool openSdStreamFile() {
+    if (!sdReady) {
+        Serial.println("[sd-stream] SD not ready");
+        return false;
+    }
+    ensureSDSpace();
+
+    const char* ext = useMp3 ? "mp3" : "wav";
+    const char* root = "/wav";
+    char dirPath[64];
+    buildDateDir(dirPath, sizeof(dirPath), root);
+    mkdirP(dirPath);
+
+    generateUUID(sdRecUUID);
+    snprintf(sdRecPath, sizeof(sdRecPath), "%s/%.36s.%s", dirPath, sdRecUUID, ext);
+
+    sdRecFile = SD.open(sdRecPath, FILE_WRITE);
+    if (!sdRecFile) {
+        Serial.printf("[sd-stream] open(%s) failed\n", sdRecPath);
+        return false;
+    }
+
+    sdRecSamples = 0;
+    sdRecBytes   = 0;
+
+    if (!useMp3) {
+        // Write placeholder WAV header — patched with final size on close
+        uint8_t hdr[44];
+        memset(hdr, 0, 44);
+        sdRecFile.write(hdr, 44);
+        sdRecBytes = 44;
+    }
+
+#if ENABLE_MP3
+    if (useMp3) {
+        mp3Enc = mp3_encoder_init(SAMPLE_RATE, MP3_BITRATE_KBPS);
+        if (!mp3Enc) {
+            Serial.println("[sd-stream] MP3 encoder init failed");
+            sdRecFile.close();
+            return false;
+        }
+        mp3SamplesPerFrame = shine_samples_per_pass(mp3Enc);
+        mp3AccumCount = 0;
+        Serial.printf("[sd-stream] MP3 encoder ready: %d samples/frame\n",
+                      mp3SamplesPerFrame);
+    }
+#endif
+
+    Serial.printf("[sd-stream] Recording to %s\n", sdRecPath);
+    return true;
+}
+
+#if ENABLE_MP3
+// Feed PCM samples into the MP3 frame accumulator.  Full frames are
+// encoded and written to the open sdRecFile.
+void feedMp3Accumulator(const int16_t* samples, size_t count) {
+    size_t offset = 0;
+    while (offset < count) {
+        size_t space = (size_t)mp3SamplesPerFrame - mp3AccumCount;
+        size_t take  = min(space, count - offset);
+        memcpy(&mp3AccumBuf[mp3AccumCount], &samples[offset], take * 2);
+        mp3AccumCount += take;
+        offset += take;
+        if (mp3AccumCount >= (uint16_t)mp3SamplesPerFrame) {
+            int written = 0;
+            const uint8_t* frame = mp3_encode_frame(mp3Enc, mp3AccumBuf, &written);
+            if (frame && written > 0) {
+                sdRecFile.write(frame, written);
+                sdRecBytes += written;
+            }
+            mp3AccumCount = 0;
+        }
+    }
+}
+#endif
+
+// Finish an SD-stream recording: flush MP3 / patch WAV header, close file.
+void finishSdRecording() {
+    M5.Mic.end();
+    isRecording = false;
+
+#if ENABLE_MP3
+    if (useMp3 && mp3Enc) {
+        // Zero-pad and encode the last partial frame
+        if (mp3AccumCount > 0) {
+            memset(&mp3AccumBuf[mp3AccumCount], 0,
+                   ((size_t)mp3SamplesPerFrame - mp3AccumCount) * 2);
+            int written = 0;
+            const uint8_t* frame = mp3_encode_frame(mp3Enc, mp3AccumBuf, &written);
+            if (frame && written > 0) {
+                sdRecFile.write(frame, written);
+                sdRecBytes += written;
+            }
+        }
+        // Flush encoder
+        int flushed = 0;
+        const uint8_t* tail = mp3_encode_flush(mp3Enc, &flushed);
+        if (tail && flushed > 0) {
+            sdRecFile.write(tail, flushed);
+            sdRecBytes += flushed;
+        }
+        shine_close(mp3Enc);
+        mp3Enc = nullptr;
+    }
+#endif
+
+    if (!useMp3) {
+        // Patch the WAV header with the final sample count
+        sdRecFile.seek(0);
+        uint8_t hdr[44];
+        writeWavHeader(hdr, sdRecSamples);
+        sdRecFile.write(hdr, 44);
+    }
+
+    sdRecFile.close();
+    sdSaved++;
+    Serial.printf("[sd-stream] Finished: %s (%u samples, %u bytes)\n",
+                  sdRecPath, sdRecSamples, sdRecBytes);
+}
+
+// =============================================================================
+// Recording entry point
+// =============================================================================
+
 void startRecording() {
-    if (!audioBuffer && !allocateAudioBuffer()) return;
+    // Decide: SD-streaming or legacy PSRAM path
+    sdStreamMode = shouldUseSdStream();
 
     // Capture a camera thumbnail before mic DMA starts (CoreS3 only).
     // Done once per recording session; continuous-mode chunks reuse the first snap.
@@ -863,13 +1034,22 @@ void startRecording() {
     if (!continuousMode || continuousChunks == 0) captureSnapshot();
 #endif
 
-    // In continuous mode use recordBuf; in normal mode use audioBuffer (= audioBufA)
-    int16_t* buf = continuousMode ? recordBuf : audioBufA;
-    if (!buf) buf = audioBuffer;   // safety fallback
+    if (sdStreamMode) {
+        // SD-streaming: no PSRAM audio buffers needed
+        if (!openSdStreamFile()) {
+            lastStatus = "SD stream failed!";
+            return;
+        }
+    } else {
+        // Legacy PSRAM path
+        if (!audioBuffer && !allocateAudioBuffer()) return;
 
-    memset(buf, 0, audioPcmBytes());
-    audioBuffer      = buf;   // recordAudioChunk() reads this global
-    audioBufferIndex = 0;
+        int16_t* buf = continuousMode ? recordBuf : audioBufA;
+        if (!buf) buf = audioBuffer;
+        memset(buf, 0, audioPcmBytes());
+        audioBuffer      = buf;
+        audioBufferIndex = 0;
+    }
 
     // Configure M5Unified microphone — always end() first for clean codec reset
     M5.Mic.end();
@@ -884,15 +1064,22 @@ void startRecording() {
     isRecording   = true;
     recordStartMs = millis();
     appState      = continuousMode ? STATE_CONTINUOUS : STATE_RECORDING;
-    lastStatus    = continuousMode
-                    ? "Continuous: chunk 1..."
-                    : "Recording " + String(recordDurationSec) + " s...";
+
+    if (sdStreamMode) {
+        lastStatus = (useMp3 ? "SD/MP3 " : "SD/WAV ") +
+                     String(recordDurationSec) + " s...";
+    } else {
+        lastStatus = continuousMode
+                     ? "Continuous: chunk 1..."
+                     : "Recording " + String(recordDurationSec) + " s...";
+    }
 
     memset(levelHistory, 0, sizeof(levelHistory));
     levelIdx = 0;
 
-    Serial.printf("[audio] Recording started (continuous=%d). Target: %u s\n",
-                  (int)continuousMode, recordDurationSec);
+    Serial.printf("[audio] Recording started (sdStream=%d, mp3=%d, cont=%d). Target: %u s\n",
+                  (int)sdStreamMode, (int)useMp3, (int)continuousMode,
+                  recordDurationSec);
 }
 
 // Call from loop() while STATE_RECORDING or STATE_CONTINUOUS.
@@ -900,12 +1087,63 @@ void startRecording() {
 void recordAudioChunk() {
     if (!isRecording) return;
 
+    // --- SD-streaming path ---
+    if (sdStreamMode) {
+        size_t remaining = audioSampleTarget() - sdRecSamples;
+        if (remaining == 0) {
+            if (continuousMode) return;  // swapAndContinue() handles it
+            finishSdRecording();
+            appState = STATE_ENCODING;
+            Serial.printf("[sd-stream] Duration reached: %u samples\n", sdRecSamples);
+            return;
+        }
+
+        size_t chunk = min((size_t)1024, remaining);
+        static int16_t DRAM_ATTR sramChunk[1024];
+        if (M5.Mic.record(sramChunk, chunk, SAMPLE_RATE)) {
+            uint32_t t0 = millis();
+            while (M5.Mic.isRecording() && (millis() - t0 < 500)) { delay(1); }
+
+            // VU meter peak
+            int peakVal = 0;
+            for (size_t i = 0; i < chunk; i++) {
+                int av = abs((int)sramChunk[i]);
+                if (av > peakVal) peakVal = av;
+            }
+            levelHistory[levelIdx % LEVEL_BARS] = peakVal;
+            levelIdx++;
+
+            // Write to SD
+#if ENABLE_MP3
+            if (useMp3) {
+                feedMp3Accumulator(sramChunk, chunk);
+            } else
+#endif
+            {
+                sdRecFile.write((const uint8_t*)sramChunk, chunk * 2);
+                sdRecBytes += chunk * 2;
+            }
+            sdRecSamples += chunk;
+        } else {
+            delay(1);
+        }
+
+        // Check elapsed time
+        if (millis() - recordStartMs >= (unsigned long)recordDurationSec * 1000UL) {
+            if (!continuousMode) {
+                finishSdRecording();
+                appState = STATE_ENCODING;
+                Serial.printf("[sd-stream] Duration reached: %u samples in %lu ms\n",
+                              sdRecSamples, millis() - recordStartMs);
+            }
+        }
+        return;
+    }
+
+    // --- Legacy PSRAM path (unchanged) ---
     size_t remaining = audioSampleTarget() - audioBufferIndex;
     if (remaining == 0) {
         if (continuousMode) {
-            // Don't stop — swapAndContinue() in loop() will handle the swap.
-            // If the upload task is still busy we'll just keep accumulating
-            // a tiny bit past the boundary (handled by overflow guard below).
             return;
         }
         M5.Mic.end();
@@ -1046,7 +1284,301 @@ size_t jsonEscape(char* dst, size_t dstSize, const char* src) {
 }
 
 // =============================================================================
-// Build vCon JSON and POST
+// VConStream — streams vCon JSON from SD file with on-the-fly base64url.
+// =============================================================================
+// Used by the SD-streaming upload path.  Yields:
+//   1. JSON prefix (metadata + "body":")
+//   2. base64url-encoded audio file read from SD in B64_RAW_CHUNK_SIZE blocks
+//   3. JSON suffix (closing brackets + attachments)
+// HTTPClient calls read() to pull data; total Content-Length is pre-computed.
+
+class VConStream : public Stream {
+public:
+    VConStream(const char* sdPath,
+               const char* prefix, size_t prefixLen,
+               const char* suffix, size_t suffixLen)
+        : _prefix(prefix), _prefixLen(prefixLen),
+          _suffix(suffix), _suffixLen(suffixLen),
+          _phase(PHASE_PREFIX), _phasePos(0),
+          _b64BufLen(0), _b64BufPos(0)
+    {
+        _sdFile = SD.open(sdPath, FILE_READ);
+        _fileSize = _sdFile ? _sdFile.size() : 0;
+
+        // Pre-compute base64url output length for the file
+        size_t b64Std = ((_fileSize + 2) / 3) * 4;
+        size_t padChars = (3 - (_fileSize % 3)) % 3;
+        _b64UrlLen = b64Std - padChars;
+
+        _totalLen = _prefixLen + _b64UrlLen + _suffixLen;
+        _served = 0;
+    }
+
+    ~VConStream() { if (_sdFile) _sdFile.close(); }
+
+    size_t totalLength() const { return _totalLen; }
+
+    int available() override {
+        return (int)(_totalLen - _served);
+    }
+
+    int read() override {
+        uint8_t c;
+        return (readBytes((char*)&c, 1) == 1) ? (int)c : -1;
+    }
+
+    size_t readBytes(char* buf, size_t len) override {
+        size_t filled = 0;
+        while (filled < len && _phase != PHASE_DONE) {
+            switch (_phase) {
+            case PHASE_PREFIX: {
+                size_t rem = _prefixLen - _phasePos;
+                size_t take = min(rem, len - filled);
+                memcpy(buf + filled, _prefix + _phasePos, take);
+                _phasePos += take;
+                filled += take;
+                _served += take;
+                if (_phasePos >= _prefixLen) {
+                    _phase = PHASE_BODY;
+                    _phasePos = 0;
+                }
+                break;
+            }
+            case PHASE_BODY: {
+                // Serve from the base64 encode buffer first
+                if (_b64BufPos < _b64BufLen) {
+                    size_t rem = _b64BufLen - _b64BufPos;
+                    size_t take = min(rem, len - filled);
+                    memcpy(buf + filled, _b64Buf + _b64BufPos, take);
+                    _b64BufPos += take;
+                    filled += take;
+                    _served += take;
+                    break;
+                }
+                // Refill: read raw bytes from SD, encode to base64url
+                if (!_sdFile || !_sdFile.available()) {
+                    _phase = PHASE_SUFFIX;
+                    _phasePos = 0;
+                    break;
+                }
+                uint8_t raw[B64_RAW_CHUNK_SIZE];
+                size_t nRead = _sdFile.read(raw, B64_RAW_CHUNK_SIZE);
+                if (nRead == 0) {
+                    _phase = PHASE_SUFFIX;
+                    _phasePos = 0;
+                    break;
+                }
+                // Encode to standard base64
+                size_t b64Len = 0;
+                mbedtls_base64_encode(_b64Buf, sizeof(_b64Buf), &b64Len, raw, nRead);
+                // Convert to base64url in-place, strip padding
+                _b64BufLen = 0;
+                for (size_t i = 0; i < b64Len; i++) {
+                    uint8_t c = _b64Buf[i];
+                    if (c == '=') continue;  // strip padding
+                    if (c == '+') c = '-';
+                    else if (c == '/') c = '_';
+                    _b64Buf[_b64BufLen++] = c;
+                }
+                _b64BufPos = 0;
+                // Don't break — loop back to serve from the freshly filled buffer
+                break;
+            }
+            case PHASE_SUFFIX: {
+                size_t rem = _suffixLen - _phasePos;
+                size_t take = min(rem, len - filled);
+                memcpy(buf + filled, _suffix + _phasePos, take);
+                _phasePos += take;
+                filled += take;
+                _served += take;
+                if (_phasePos >= _suffixLen) _phase = PHASE_DONE;
+                break;
+            }
+            case PHASE_DONE:
+                break;
+            }
+        }
+        return filled;
+    }
+
+    // Stream requires these but we only need the read side
+    size_t write(uint8_t) override { return 0; }
+    int peek() override { return -1; }
+
+    // Reset for retry — rewind SD file and restart from prefix
+    void rewind() {
+        if (_sdFile) _sdFile.seek(0);
+        _phase = PHASE_PREFIX;
+        _phasePos = 0;
+        _b64BufLen = 0;
+        _b64BufPos = 0;
+        _served = 0;
+    }
+
+private:
+    enum Phase { PHASE_PREFIX, PHASE_BODY, PHASE_SUFFIX, PHASE_DONE };
+
+    const char* _prefix;
+    size_t      _prefixLen;
+    const char* _suffix;
+    size_t      _suffixLen;
+    File        _sdFile;
+    size_t      _fileSize;
+    size_t      _b64UrlLen;
+    size_t      _totalLen;
+    size_t      _served;
+    Phase       _phase;
+    size_t      _phasePos;
+
+    // Base64 encode buffer: B64_RAW_CHUNK_SIZE raw → up to B64_ENC_CHUNK_SIZE+4 encoded
+    uint8_t _b64Buf[B64_ENC_CHUNK_SIZE + 4];
+    size_t  _b64BufLen;
+    size_t  _b64BufPos;
+};
+
+// =============================================================================
+// SD-streaming upload: build vCon JSON from SD file and POST via VConStream
+// =============================================================================
+
+bool buildAndUploadVConFromSD(const char* audioPath, const char* uuid,
+                              uint32_t numSamples) {
+    if (!wifiConnected) return false;
+
+    Serial.printf("[vcon-sd] Building vCon from SD: %s (%u samples)\n",
+                  audioPath, numSamples);
+
+    // Gather metadata
+    char timestamp[32];
+    getTimestamp(timestamp, sizeof(timestamp));
+    String macStr = WiFi.macAddress();
+
+    const char* mime = useMp3 ? "audio/mpeg" : "audio/wav";
+
+    char tagsRaw[320];
+    snprintf(tagsRaw, sizeof(tagsRaw),
+             "{\"source\":\"m5stack-core2\","
+             "\"device_id\":\"%s\","
+             "\"mac\":\"%s\","
+             "\"sample_rate\":%d,"
+             "\"duration_seconds\":%u,"
+             "\"format\":\"%s\"}",
+             deviceID.c_str(), macStr.c_str(), SAMPLE_RATE,
+             (unsigned)(numSamples / SAMPLE_RATE), mime);
+    char tagsEsc[512];
+    jsonEscape(tagsEsc, sizeof(tagsEsc), tagsRaw);
+
+    char prefix[1024];
+    int prefixLen = snprintf(prefix, sizeof(prefix),
+        "{"
+          "\"vcon\":\"0.4.0\","
+          "\"uuid\":\"%s\","
+          "\"created_at\":\"%s\","
+          "\"extensions\":[\"meta\"],"
+          "\"parties\":[{"
+            "\"name\":\"M5Stack Recorder\","
+            "\"role\":\"recorder\","
+            "\"meta\":{"
+              "\"device_id\":\"%s\","
+              "\"vconic_id\":\"%s\","
+              "\"device_type\":\"m5stack-core2\""
+            "}"
+          "}],"
+          "\"dialog\":[{"
+            "\"type\":\"recording\","
+            "\"start\":\"%s\","
+            "\"duration\":%u,"
+            "\"parties\":[0],"
+            "\"originator\":0,"
+            "\"mimetype\":\"%s\","
+            "\"encoding\":\"base64url\","
+            "\"body\":\"",
+        uuid, timestamp, macStr.c_str(), deviceID.c_str(), timestamp,
+        (unsigned)(numSamples / SAMPLE_RATE), mime);
+
+    char suffix[640];
+    int suffixLen = snprintf(suffix, sizeof(suffix),
+        "\"}],"
+        "\"analysis\":[],"
+        "\"attachments\":[{"
+          "\"purpose\":\"tags\","
+          "\"start\":\"%s\","
+          "\"party\":0,"
+          "\"dialog\":0,"
+          "\"encoding\":\"json\","
+          "\"body\":\"%s\""
+        "}]}",
+        timestamp, tagsEsc);
+
+    // Build URL
+    uploadTaskState = UTS_UPLOADING;
+    String urlFinal = postURL;
+    if (deviceToken.length() > 0) {
+        urlFinal += (urlFinal.indexOf('?') >= 0) ? "&" : "?";
+        urlFinal += "token=" + deviceToken;
+    }
+
+    Serial.printf("[vcon-sd] POST → %s\n", urlFinal.c_str());
+
+    const unsigned long retryDelayMs[3] = { 5000UL, 30000UL, 300000UL };
+    int httpCode = 0;
+
+    for (int attempt = 0; attempt <= 3; attempt++) {
+        if (attempt > 0) {
+            uploadTaskState = UTS_RETRY;
+            uploadRetryNum  = (uint8_t)attempt;
+            unsigned long waitMs = retryDelayMs[attempt - 1];
+            Serial.printf("[vcon-sd] Retry %d in %lu ms\n", attempt, waitMs);
+            unsigned long t0 = millis();
+            while (millis() - t0 < waitMs) { yield(); delay(10); }
+            uploadTaskState = UTS_UPLOADING;
+        }
+
+        VConStream vcs(audioPath, prefix, (size_t)prefixLen,
+                       suffix, (size_t)suffixLen);
+        size_t totalLen = vcs.totalLength();
+
+        Serial.printf("[vcon-sd] Stream total: %zu bytes\n", totalLen);
+
+        HTTPClient http;
+        http.begin(urlFinal);
+        http.addHeader("Content-Type", "application/json");
+        if (deviceToken.length() > 0)
+            http.addHeader("X-Device-Token", deviceToken);
+        http.setTimeout(120000);  // longer timeout for large files
+
+        httpCode = http.sendRequest("POST", &vcs, totalLen);
+        if (httpCode > 0) {
+            String resp = http.getString();
+            if (resp.length() > 80) resp = resp.substring(0, 77) + "...";
+            Serial.printf("[vcon-sd] HTTP %d: %s\n", httpCode, resp.c_str());
+        } else {
+            Serial.printf("[vcon-sd] Network error: %d\n", httpCode);
+        }
+        http.end();
+
+        if (httpCode == 202 || httpCode == 200) break;
+        if (httpCode == 400) break;
+    }
+
+    uploadTaskHttpCode = (int32_t)httpCode;
+
+    if (httpCode == 202 || httpCode == 200) {
+        totalUploads++;
+        saveConfig();
+        uploadTaskState = UTS_DONE_OK;
+        Serial.printf("[vcon-sd] SUCCESS HTTP %d  UUID:%s\n", httpCode, uuid);
+        return true;
+    } else {
+        failedUploads++;
+        saveConfig();
+        uploadTaskState = UTS_DONE_FAIL;
+        Serial.printf("[vcon-sd] FAILED HTTP %d\n", httpCode);
+        return false;
+    }
+}
+
+// =============================================================================
+// Build vCon JSON and POST (legacy PSRAM path)
 // =============================================================================
 //
 // buildAndUploadVConCore(buf, numSamples)
@@ -1339,8 +1871,37 @@ bool buildAndUploadVConCore(const int16_t* buf, size_t numSamples) {
 
 // Normal (single-shot) mode wrapper.
 bool buildAndUploadVCon() {
+    if (!wifiConnected) { lastStatus = "No WiFi connection"; return false; }
+
+    // SD-streaming path: audio is already on SD — use VConStream upload
+    if (sdStreamMode) {
+        if (sdRecSamples == 0) { lastStatus = "No audio recorded"; return false; }
+
+        appState   = STATE_ENCODING;
+        lastStatus = useMp3 ? "Uploading MP3..." : "Uploading WAV...";
+        updateDisplay();
+
+        uploadTaskState    = UTS_IDLE;
+        uploadTaskHttpCode = 0;
+
+        bool ok = buildAndUploadVConFromSD(sdRecPath, sdRecUUID, sdRecSamples);
+
+        lastHttpCode = (int)uploadTaskHttpCode;
+        if (ok) {
+            lastStatus    = (lastHttpCode == 202) ? "vCon routed! HTTP 202"
+                                                  : "vCon accepted HTTP 200";
+            appState      = STATE_SUCCESS;
+            stateChangeMs = millis();
+        } else {
+            lastStatus    = "Upload failed: HTTP " + String(lastHttpCode);
+            appState      = STATE_ERROR;
+            stateChangeMs = millis();
+        }
+        return ok;
+    }
+
+    // Legacy PSRAM path
     if (audioBufferIndex == 0) { lastStatus = "No audio recorded"; return false; }
-    if (!wifiConnected)         { lastStatus = "No WiFi connection"; return false; }
 
     appState   = STATE_ENCODING;
     lastStatus = "Encoding audio...";
@@ -1387,8 +1948,96 @@ void startUploadTask(int16_t* buf, size_t numSamples) {
         &g_uploadTaskHandle, 0);   // core 0
 }
 
+// SD-streaming upload task — uploads a completed SD file on core 0.
+struct SdUploadJob {
+    char path[120];
+    char uuid[37];
+    uint32_t numSamples;
+};
+static SdUploadJob g_sdUploadJob;
+
+void sdUploadTaskFn(void* /*param*/) {
+    buildAndUploadVConFromSD(g_sdUploadJob.path, g_sdUploadJob.uuid,
+                             g_sdUploadJob.numSamples);
+    continuousChunks++;
+    uploadBusy = false;
+    vTaskDelete(nullptr);
+}
+
+void startSdUploadTask(const char* path, const char* uuid, uint32_t numSamples) {
+    strncpy(g_sdUploadJob.path, path, sizeof(g_sdUploadJob.path) - 1);
+    strncpy(g_sdUploadJob.uuid, uuid, sizeof(g_sdUploadJob.uuid) - 1);
+    g_sdUploadJob.numSamples = numSamples;
+    uploadBusy      = true;
+    uploadTaskState = UTS_ENCODING;
+    xTaskCreatePinnedToCore(
+        sdUploadTaskFn, "vcon_sd_up",
+        16 * 1024, nullptr, 1,
+        &g_uploadTaskHandle, 0);
+}
+
 // Called every loop() tick in continuous mode.
 void swapAndContinue() {
+    // --- SD-streaming continuous swap ---
+    if (sdStreamMode) {
+        bool durationDone = (millis() - recordStartMs >=
+                             (unsigned long)recordDurationSec * 1000UL);
+        bool samplesDone  = (sdRecSamples >= audioSampleTarget());
+
+        if (!(durationDone || samplesDone)) return;
+
+        if (uploadBusy) {
+            if (samplesDone) {
+                // Spinwait — DMA ring buffer absorbs audio while we wait
+                Serial.println("[cont-sd] upload busy — waiting...");
+                while (uploadBusy) { yield(); delay(5); }
+            } else {
+                return;
+            }
+        }
+
+        // Finish the current SD file
+        finishSdRecording();
+
+        // Save completed file info for the upload task
+        char donePath[120];
+        char doneUUID[37];
+        strncpy(donePath, sdRecPath, sizeof(donePath));
+        strncpy(doneUUID, sdRecUUID, sizeof(doneUUID));
+        uint32_t doneSamples = sdRecSamples;
+
+        if (stopContinuous) {
+            M5.Mic.end();
+            isRecording    = false;
+            continuousMode = false;
+            stopContinuous = false;
+            sdStreamMode   = false;
+            appState       = STATE_UPLOADING;
+            lastStatus     = "Finishing last chunk...";
+        } else {
+            // Open a new SD file and resume recording immediately
+            if (!openSdStreamFile()) {
+                M5.Mic.end();
+                isRecording    = false;
+                continuousMode = false;
+                sdStreamMode   = false;
+                appState       = STATE_ERROR;
+                lastStatus     = "SD stream failed!";
+                return;
+            }
+            isRecording   = true;
+            recordStartMs = millis();
+            lastStatus = "SD continuous: chunk " +
+                         String((uint32_t)continuousChunks + 1) + "...";
+        }
+
+        Serial.printf("[cont-sd] swap → uploading %u samples from %s\n",
+                      doneSamples, donePath);
+        startSdUploadTask(donePath, doneUUID, doneSamples);
+        return;
+    }
+
+    // --- Legacy PSRAM continuous swap ---
     bool durationDone = (millis() - recordStartMs >=
                          (unsigned long)recordDurationSec * 1000UL);
     bool bufferFull   = (audioBufferIndex >= audioSampleTarget());
@@ -1906,22 +2555,31 @@ void drawDurationScreen() {
     gfx->fillRect(0, UI_CONTENT_Y + 14, SCREEN_W, UI_CONTENT_H - 14, TFT_BLACK);
 
     bool cont = (durEditPending <= CONT_MAX_DURATION_SEC);
+    bool sdMode = (durEditPending > CONT_MAX_DURATION_SEC) || sdStreamForce;
 
     // ── Large centred value ──────────────────────────────────────────────────
-    // Size-5 char: 6×8 × 5 = 30×40 px per glyph
-    char nbuf[8];
-    snprintf(nbuf, sizeof(nbuf), "%u", durEditPending);
+    char nbuf[12];
+    if (durEditPending >= 120) {
+        // Show as MM:SS
+        snprintf(nbuf, sizeof(nbuf), "%u:%02u",
+                 durEditPending / 60, durEditPending % 60);
+    } else {
+        snprintf(nbuf, sizeof(nbuf), "%u", durEditPending);
+    }
     int numGlyphs = strlen(nbuf);
-    int numW = numGlyphs * 30 + 30;   // digits + " s" (2 glyphs × 30/2 ≈ rough)
+    int numW = numGlyphs * 30 + 30;
     int numX = (SCREEN_W - numW) / 2;
     if (numX < 4) numX = 4;
     gfx->setTextSize(5);
-    gfx->setTextColor(cont ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
+    uint16_t valColor = sdMode ? TFT_CYAN : (cont ? TFT_GREEN : TFT_YELLOW);
+    gfx->setTextColor(valColor, TFT_BLACK);
     gfx->setCursor(numX, 28);
     gfx->print(nbuf);
-    gfx->setTextSize(2);
-    gfx->setTextColor(TFT_WHITE, TFT_BLACK);
-    gfx->print(" s");
+    if (durEditPending < 120) {
+        gfx->setTextSize(2);
+        gfx->setTextColor(TFT_WHITE, TFT_BLACK);
+        gfx->print(" s");
+    }
 
     // ── Range bar (y=90) ────────────────────────────────────────────────────
     const int bx = 10, by = 92, bw = SCREEN_W - 20, bh = 12;
@@ -1945,13 +2603,23 @@ void drawDurationScreen() {
     gfx->setCursor(cmLabelX, by - 14);
     gfx->print(cmLabel);
     gfx->setTextColor(TFT_DARKGREY, TFT_BLACK);
-    char maxLabel[8]; snprintf(maxLabel, sizeof(maxLabel), "%us", MAX_RECORD_DURATION_SEC);
+    char maxLabel[12];
+    if (MAX_RECORD_DURATION_SEC >= 120)
+        snprintf(maxLabel, sizeof(maxLabel), "%u:%02u",
+                 MAX_RECORD_DURATION_SEC / 60, MAX_RECORD_DURATION_SEC % 60);
+    else
+        snprintf(maxLabel, sizeof(maxLabel), "%us", MAX_RECORD_DURATION_SEC);
     gfx->setCursor(bx + bw - (int)strlen(maxLabel) * 6, by + bh + 4);
     gfx->print(maxLabel);
 
     // ── Mode badge ──────────────────────────────────────────────────────────
     gfx->setTextSize(1);
-    if (cont) {
+    if (sdMode) {
+        gfx->setTextColor(TFT_CYAN, TFT_BLACK);
+        gfx->setCursor(10, 134);
+        gfx->printf("\x7e SD-STREAM  (%s, up to 60 min)",
+                     useMp3 ? "MP3" : "WAV");
+    } else if (cont) {
         gfx->setTextColor(TFT_GREEN, TFT_BLACK);
         gfx->setCursor(10, 134);
         gfx->print("\x7e CONTINUOUS  (zero-gap dual-buffer)");
@@ -1964,7 +2632,8 @@ void drawDurationScreen() {
     // ── Hint line ───────────────────────────────────────────────────────────
     gfx->setTextColor(TFT_DARKGREY, TFT_BLACK);
     gfx->setCursor(10, 152);
-    gfx->printf("Steps: 5 s  |  SAVE stores to flash");
+    uint32_t stepSize = (durEditPending >= 120) ? 60 : 5;
+    gfx->printf("Steps: %u s  |  SAVE stores to flash", stepSize);
 
     // Unsaved-change indicator
     if (durEditPending != recordDurationSec) {
@@ -2703,7 +3372,13 @@ void handleButtons() {
             if (btnAPressed()) {
                 // RUN — same logic as old BtnA handler
                 checkWiFi();
-                if (!audioBuffer && !allocateAudioBuffer()) {
+                if (shouldUseSdStream()) {
+                    // SD-streaming path — no PSRAM audio buffers needed
+                    continuousMode   = true;
+                    stopContinuous   = false;
+                    continuousChunks = 0;
+                    startRecording();
+                } else if (!audioBuffer && !allocateAudioBuffer()) {
                     lastStatus    = "PSRAM alloc failed!";
                     appState      = STATE_ERROR;
                     stateChangeMs = millis();
@@ -2734,14 +3409,28 @@ void handleButtons() {
                     stopContinuous = true;
                     lastStatus = "Stopping after this chunk...";
                 } else if (appState == STATE_RECORDING) {
-                    M5.Mic.end();
-                    isRecording = false;
-                    if (audioBufferIndex > 0) {
-                        appState   = STATE_ENCODING;
-                        lastStatus = "Stopped early \x7e encoding...";
+                    if (sdStreamMode) {
+                        if (sdRecSamples > 0) {
+                            finishSdRecording();
+                            appState   = STATE_ENCODING;
+                            lastStatus = "Stopped early ~ uploading...";
+                        } else {
+                            M5.Mic.end();
+                            isRecording  = false;
+                            sdStreamMode = false;
+                            appState     = STATE_IDLE;
+                            lastStatus   = "Recording cancelled";
+                        }
                     } else {
-                        appState   = STATE_IDLE;
-                        lastStatus = "Recording cancelled";
+                        M5.Mic.end();
+                        isRecording = false;
+                        if (audioBufferIndex > 0) {
+                            appState   = STATE_ENCODING;
+                            lastStatus = "Stopped early \x7e encoding...";
+                        } else {
+                            appState   = STATE_IDLE;
+                            lastStatus = "Recording cancelled";
+                        }
                     }
                 }
             }
@@ -2769,11 +3458,12 @@ void handleButtons() {
         }
         break;
 
-    case SCREEN_DURATION:
+    case SCREEN_DURATION: {
         if (btnAPressed()) {
             // LESS — decrease by 5 s, clamp at minimum
             if (durEditPending > MIN_RECORD_DURATION_SEC) {
-                uint32_t next = durEditPending - 5;
+                uint32_t s = (durEditPending <= 120) ? 5 : 60;
+                uint32_t next = (durEditPending > s) ? durEditPending - s : MIN_RECORD_DURATION_SEC;
                 durEditPending = (next < MIN_RECORD_DURATION_SEC)
                                  ? MIN_RECORD_DURATION_SEC : next;
             }
@@ -2781,7 +3471,8 @@ void handleButtons() {
         if (btnCPressed()) {
             // MORE — increase by 5 s, clamp at maximum
             if (durEditPending < MAX_RECORD_DURATION_SEC) {
-                uint32_t next = durEditPending + 5;
+                uint32_t s = (durEditPending >= 120) ? 60 : 5;
+                uint32_t next = durEditPending + s;
                 durEditPending = (next > MAX_RECORD_DURATION_SEC)
                                  ? MAX_RECORD_DURATION_SEC : next;
             }
@@ -2790,19 +3481,22 @@ void handleButtons() {
             // SAVE — commit and free old buffers so they reallocate at new size
             if (appState == STATE_RECORDING || appState == STATE_CONTINUOUS ||
                 appState == STATE_ENCODING  || appState == STATE_UPLOADING) {
-                // Can't change mid-recording — silently ignore (screen shows old value)
+                // Can't change mid-recording — silently ignore
             } else {
                 recordDurationSec = durEditPending;
                 freeAudioBuffers();
                 saveConfig();
+                const char* mode;
+                if (shouldUseSdStream()) mode = useMp3 ? "SD/MP3" : "SD/WAV";
+                else if (recordDurationSec <= CONT_MAX_DURATION_SEC) mode = "continuous";
+                else mode = "single-shot";
                 Serial.printf("[dur] Duration set to %u s (%s)\n",
-                              recordDurationSec,
-                              recordDurationSec <= CONT_MAX_DURATION_SEC
-                              ? "continuous" : "single-shot");
+                              recordDurationSec, mode);
             }
             currentScreen = SCREEN_CONFIG;
         }
         break;
+    }
 
     case SCREEN_TOOLS:
         handleToolsButtons();
@@ -2854,9 +3548,14 @@ void handleSerialCommand(const String& cmd) {
     } else if (cmd.startsWith("dur ") || cmd == "dur") {
         if (cmd == "dur") {
             // 'dur' with no argument prints current value
-            Serial.printf("[cmd] Recording duration: %u s (%s mode)\n",
-                          recordDurationSec,
-                          recordDurationSec <= CONT_MAX_DURATION_SEC ? "continuous" : "single-shot");
+            {
+                const char* mode;
+                if (shouldUseSdStream()) mode = useMp3 ? "SD/MP3" : "SD/WAV";
+                else if (recordDurationSec <= CONT_MAX_DURATION_SEC) mode = "continuous";
+                else mode = "single-shot";
+                Serial.printf("[cmd] Recording duration: %u s (%s mode)\n",
+                              recordDurationSec, mode);
+            }
         } else {
             // Reject change while recording
             if (appState == STATE_RECORDING || appState == STATE_CONTINUOUS ||
@@ -2874,25 +3573,53 @@ void handleSerialCommand(const String& cmd) {
                     // Free existing buffers — they'll be reallocated at the new size on next RUN
                     freeAudioBuffers();
                     Serial.printf("[cmd] Duration set to %u s", recordDurationSec);
-                    if (recordDurationSec > CONT_MAX_DURATION_SEC) {
-                        Serial.printf(" (> %u s — continuous mode disabled, using single-shot)\n",
-                                      CONT_MAX_DURATION_SEC);
-                    } else {
+                    if (shouldUseSdStream()) {
+                        Serial.printf(" (SD-streaming, %s)\n",
+                                      useMp3 ? "MP3" : "WAV");
+                    } else if (recordDurationSec <= CONT_MAX_DURATION_SEC) {
                         Serial.println(" (continuous mode available)");
+                    } else {
+                        Serial.println(" (single-shot PSRAM)");
                     }
                     Serial.println("[cmd] Buffers freed — will reallocate on next RUN press");
                 }
             }
+        }
+    } else if (cmd.startsWith("mp3") || cmd.startsWith("sdstream")) {
+        // mp3 on / mp3 off / mp3 (show status)
+        // sdstream on / sdstream off / sdstream (show status)
+        bool isMp3Cmd = cmd.startsWith("mp3");
+        String arg = cmd.substring(isMp3Cmd ? 3 : 8);
+        arg.trim();
+
+        if (isMp3Cmd) {
+#if ENABLE_MP3
+            if (arg == "on")  { useMp3 = true;  saveConfig(); Serial.println("[cmd] MP3 encoding ON"); }
+            else if (arg == "off") { useMp3 = false; saveConfig(); Serial.println("[cmd] MP3 encoding OFF (WAV)"); }
+            else { Serial.printf("[cmd] MP3 encoding: %s\n", useMp3 ? "ON" : "OFF"); }
+#else
+            Serial.println("[cmd] MP3 not compiled — set ENABLE_MP3=1 in config.h");
+#endif
+        } else {
+            if (arg == "on")  { sdStreamForce = true;  Serial.println("[cmd] SD-streaming forced ON"); }
+            else if (arg == "off") { sdStreamForce = false; Serial.println("[cmd] SD-streaming auto"); }
+            else { Serial.printf("[cmd] SD-streaming: %s\n",
+                                 sdStreamForce ? "forced ON" : "auto (>45s)"); }
         }
     } else if (cmd == "status") {
         Serial.println("\n=== vCon Recorder Status ===");
         Serial.printf("Firmware:    %s\n", FIRMWARE_VERSION);
         Serial.printf("Device ID:   %s\n", deviceID.c_str());
         Serial.printf("MAC Address: %s\n", WiFi.macAddress().c_str());
-        Serial.printf("Rec Duration:%u s (%s mode, range %u-%u s)\n",
-                      recordDurationSec,
-                      recordDurationSec <= CONT_MAX_DURATION_SEC ? "continuous" : "single-shot",
-                      MIN_RECORD_DURATION_SEC, MAX_RECORD_DURATION_SEC);
+        {
+            const char* mode;
+            if (shouldUseSdStream()) mode = useMp3 ? "SD/MP3" : "SD/WAV";
+            else if (recordDurationSec <= CONT_MAX_DURATION_SEC) mode = "continuous";
+            else mode = "single-shot";
+            Serial.printf("Rec Duration:%u s (%s, range %u-%u s)\n",
+                          recordDurationSec, mode,
+                          MIN_RECORD_DURATION_SEC, MAX_RECORD_DURATION_SEC);
+        }
         Serial.printf("Device Token:%s\n",
                       deviceToken.length() > 0 ? deviceToken.c_str() : "(none — using MAC routing)");
         Serial.printf("WiFi SSID:   %s\n", wifiSSID.c_str());
@@ -2907,6 +3634,10 @@ void handleSerialCommand(const String& cmd) {
         Serial.printf("Total Fail:  %u\n", failedUploads);
         Serial.printf("Free Heap:   %u bytes\n", ESP.getFreeHeap());
         Serial.printf("Free PSRAM:  %u bytes\n", ESP.getFreePsram());
+#if ENABLE_MP3
+        Serial.printf("MP3 Encode:  %s\n", useMp3 ? "ON" : "OFF");
+#endif
+        Serial.printf("SD Stream:   %s\n", sdStreamForce ? "forced ON" : "auto");
         Serial.printf("App State:   %d\n", (int)appState);
         Serial.println("============================\n");
     } else if (cmd == "scan") {
@@ -2947,6 +3678,9 @@ void handleSerialCommand(const String& cmd) {
         Serial.printf( "dur   <10-%u>           Set recording duration in seconds\n",
                        MAX_RECORD_DURATION_SEC);
         Serial.println("dur                       Show current recording duration");
+        Serial.println("mp3 on/off                Toggle MP3 compression (SD-stream)");
+        Serial.println("mp3                       Show MP3 status");
+        Serial.println("sdstream on/off           Force SD-streaming mode on/off");
         Serial.println("status                    Show current config");
         Serial.println("sd                        Show SD card status");
         Serial.println("restart                   Reboot device");
