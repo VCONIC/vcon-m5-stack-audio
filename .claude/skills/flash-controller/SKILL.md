@@ -8,7 +8,19 @@ Diagnose and/or update a connected M5Stack vCon Recorder device (Core2 or CoreS3
 
 ## 1. Find the device
 
-Run `ls /dev/cu.usbserial-*` to discover connected USB serial ports. If multiple ports are found, list them and ask the user which one to use. If none are found, tell the user to connect the device and retry.
+Run `ls /dev/cu.usbserial-* /dev/cu.usbmodem* 2>/dev/null` to discover connected USB serial ports. Note the port pattern differs by board:
+
+| Board | USB chip | Port pattern |
+|-------|----------|--------------|
+| Core2 | CH9102F (USB-UART bridge) | `/dev/cu.usbserial-XXXXXXX` |
+| CoreS3 | Native ESP32-S3 USB (CDC) | `/dev/cu.usbmodem-XXXXXXX` |
+
+If multiple ports are found, list them and ask the user which one to use. If none are found, tell the user to:
+1. Check the USB cable is a data cable (not charge-only)
+2. Try a different USB port (avoid hubs if possible)
+3. For CoreS3 in a boot loop or crashed state: hold the reset button while plugging in to force USB bootloader mode
+
+Then retry.
 
 ## 2. Determine the board type
 
@@ -21,7 +33,7 @@ Ask the user which board they have connected: **Core2** or **CoreS3**. Use this 
 
 ## 3. Release any busy port
 
-Run `lsof /dev/cu.usbserial-*` to see if any process has the port open. If so, kill that process (`kill <pid>`) before proceeding — do not ask the user to do it.
+Run `lsof <port>` to see if any process has the port open. If so, kill that process (`kill <pid>`) before proceeding — do not ask the user to do it.
 
 ## 4. Read current firmware version from device
 
