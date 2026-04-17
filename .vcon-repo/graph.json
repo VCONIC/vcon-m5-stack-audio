@@ -3,9 +3,9 @@
   "repo": "vcon-m5-stack-audio",
   "repo_version": null,
   "archetype": "firmware",
-  "generated_at": "2026-04-16T15:15:48.656122+00:00",
+  "generated_at": "2026-04-17T12:29:51.830732+00:00",
   "stats": {
-    "node_count": 7,
+    "node_count": 9,
     "edge_count": 0
   },
   "nodes": [
@@ -28,6 +28,12 @@
       "file": "VConRecorder/ota.h"
     },
     {
+      "id": "component:shine_mp3",
+      "type": "component",
+      "name": "shine_mp3",
+      "file": "VConRecorder/shine_mp3.h"
+    },
+    {
       "id": "component:VConRecorder",
       "type": "component",
       "name": "VConRecorder",
@@ -37,6 +43,12 @@
       "id": "task:uploadTaskFn",
       "type": "task",
       "name": "uploadTaskFn",
+      "file": "VConRecorder/VConRecorder.ino"
+    },
+    {
+      "id": "task:sdUploadTaskFn",
+      "type": "task",
+      "name": "sdUploadTaskFn",
       "file": "VConRecorder/VConRecorder.ino"
     },
     {
