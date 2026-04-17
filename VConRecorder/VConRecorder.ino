@@ -158,6 +158,37 @@ int      levelIdx = 0;
 unsigned long lastDisplayMs = 0;
 const unsigned long DISPLAY_INTERVAL_MS = 300;
 
+// =============================================================================
+// Touch-screen button emulation (CoreS3)
+// =============================================================================
+// CoreS3 has no physical buttons below the screen.  We map taps in the
+// on-screen button row (y >= UI_BTN_Y) to virtual BtnA / BtnB / BtnC.
+// State is computed once per frame in updateTouchButtons() before any
+// button-check code runs.  On Core2 this compiles away to nothing.
+// =============================================================================
+#if TOUCH_SCREEN_BUTTONS
+static bool g_touchA = false, g_touchB = false, g_touchC = false;
+
+void updateTouchButtons() {
+    g_touchA = g_touchB = g_touchC = false;
+    auto t = M5.Touch.getDetail();
+    if (t.wasPressed() && t.y >= UI_BTN_Y) {
+        int zone = t.x * 3 / SCREEN_W;
+        if (zone == 0)      g_touchA = true;
+        else if (zone == 1) g_touchB = true;
+        else                g_touchC = true;
+    }
+}
+inline bool btnAPressed() { return M5.BtnA.wasPressed() || g_touchA; }
+inline bool btnBPressed() { return M5.BtnB.wasPressed() || g_touchB; }
+inline bool btnCPressed() { return M5.BtnC.wasPressed() || g_touchC; }
+#else
+inline void updateTouchButtons() {}
+inline bool btnAPressed() { return M5.BtnA.wasPressed(); }
+inline bool btnBPressed() { return M5.BtnB.wasPressed(); }
+inline bool btnCPressed() { return M5.BtnC.wasPressed(); }
+#endif
+
 // Full-screen off-screen canvas for flicker-free rendering.
 // All draw functions paint into this sprite; updateDisplay() pushes the
 // completed frame to the physical display in one transfer so intermediate
@@ -2388,22 +2419,22 @@ void handleWifiButtons() {
     case WPHASE_SELECT:
         if (wifiScanCount == 0) {
             // No networks: SCAN or BACK
-            if (M5.BtnA.wasPressed()) {
+            if (btnAPressed()) {
                 wifiPhase = WPHASE_SCANNING;  // re-scan triggered in loop()
             }
-            if (M5.BtnC.wasPressed()) {
+            if (btnCPressed()) {
                 exitWifiPicker(SCREEN_CONFIG);
             }
         } else {
-            if (M5.BtnA.wasPressed()) {
+            if (btnAPressed()) {
                 // BACK — return to config without connecting
                 exitWifiPicker(SCREEN_CONFIG);
             }
-            if (M5.BtnC.wasPressed()) {
+            if (btnCPressed()) {
                 // NEXT (wraps, so all networks reachable without PREV)
                 wifiSelIdx = (wifiSelIdx + 1) % wifiScanCount;
             }
-            if (M5.BtnB.wasPressed()) {
+            if (btnBPressed()) {
                 // SELECT — open networks skip password
                 if (wifiScanOpen[wifiSelIdx]) {
                     wifiPwdBuf = "";
@@ -2418,16 +2449,16 @@ void handleWifiButtons() {
         break;
 
     case WPHASE_PASSWORD:
-        if (M5.BtnA.wasPressed()) {
+        if (btnAPressed()) {
             // PREV char
             if (wifiCharIdx == 0) wifiCharIdx = WIFI_IDX_TOTAL - 1;
             else wifiCharIdx--;
         }
-        if (M5.BtnC.wasPressed()) {
+        if (btnCPressed()) {
             // NEXT char
             wifiCharIdx = (wifiCharIdx + 1) % WIFI_IDX_TOTAL;
         }
-        if (M5.BtnB.wasPressed()) {
+        if (btnBPressed()) {
             // ADD / action
             if (wifiCharIdx == WIFI_IDX_DONE) {
                 // Done — connect
@@ -2449,11 +2480,11 @@ void handleWifiButtons() {
         break;
 
     case WPHASE_RESULT:
-        if (M5.BtnA.wasPressed()) {
+        if (btnAPressed()) {
             // SCAN again
             wifiPhase = WPHASE_SCANNING;
         }
-        if (M5.BtnC.wasPressed()) {
+        if (btnCPressed()) {
             exitWifiPicker(SCREEN_HOME);
         }
         if ((millis() - wifiResultMs) > TOOLS_RESULT_TIMEOUT_MS) {
@@ -2598,10 +2629,10 @@ void toolsRunSelected() {
 void handleToolsButtons() {
     switch (toolsPhase) {
     case TPHASE_SELECT:
-        if (M5.BtnA.wasPressed()) {
+        if (btnAPressed()) {
             toolsSelectedItem = (toolsSelectedItem + TOOL_COUNT - 1) % TOOL_COUNT;
         }
-        if (M5.BtnB.wasPressed()) {
+        if (btnBPressed()) {
             if (appState == STATE_RECORDING || appState == STATE_CONTINUOUS) {
                 toolsResultOK    = false;
                 toolsResultLine1 = "Stop recording first";
@@ -2615,18 +2646,18 @@ void handleToolsButtons() {
                 // toolsRunSelected() is called from loop() on next iteration
             }
         }
-        if (M5.BtnC.wasPressed()) {
+        if (btnCPressed()) {
             currentScreen = SCREEN_HOME;
         }
         break;
 
     case TPHASE_CONFIRM:
-        if (M5.BtnB.wasPressed()) {
+        if (btnBPressed()) {
             Serial.println("[tools] User-initiated restart");
             delay(200);
             ESP.restart();
         }
-        if (M5.BtnC.wasPressed()) {
+        if (btnCPressed()) {
             toolsPhase    = TPHASE_SELECT;
             currentScreen = SCREEN_HOME;
         }
@@ -2637,8 +2668,8 @@ void handleToolsButtons() {
         break;
 
     case TPHASE_RESULT:
-        if (M5.BtnB.wasPressed()) toolsPhase = TPHASE_SELECT;
-        if (M5.BtnC.wasPressed()) {
+        if (btnBPressed()) toolsPhase = TPHASE_SELECT;
+        if (btnCPressed()) {
             toolsPhase    = TPHASE_SELECT;
             currentScreen = SCREEN_HOME;
         }
@@ -2650,7 +2681,7 @@ void handleToolsButtons() {
 }
 
 void handleButtons() {
-    bool anyPressed = M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnC.wasPressed();
+    bool anyPressed = btnAPressed() || btnBPressed() || btnCPressed();
     if (anyPressed) lastButtonMs = millis();
 
     // Inactivity auto-return to HOME
@@ -2669,7 +2700,7 @@ void handleButtons() {
 
     case SCREEN_HOME:
         if (idle) {
-            if (M5.BtnA.wasPressed()) {
+            if (btnAPressed()) {
                 // RUN — same logic as old BtnA handler
                 checkWiFi();
                 if (!audioBuffer && !allocateAudioBuffer()) {
@@ -2694,10 +2725,10 @@ void handleButtons() {
                     startRecording();
                 }
             }
-            if (M5.BtnB.wasPressed()) currentScreen = SCREEN_CONFIG;
-            if (M5.BtnC.wasPressed()) currentScreen = SCREEN_TOOLS;
+            if (btnBPressed()) currentScreen = SCREEN_CONFIG;
+            if (btnCPressed()) currentScreen = SCREEN_TOOLS;
         } else if (activeRec) {
-            if (M5.BtnB.wasPressed()) {
+            if (btnBPressed()) {
                 // STOP — same logic as old BtnB handler
                 if (appState == STATE_CONTINUOUS) {
                     stopContinuous = true;
@@ -2714,24 +2745,24 @@ void handleButtons() {
                     }
                 }
             }
-            if (M5.BtnC.wasPressed()) currentScreen = SCREEN_STATUS;
+            if (btnCPressed()) currentScreen = SCREEN_STATUS;
         } else {
             // ENCODING / UPLOADING
-            if (M5.BtnC.wasPressed()) currentScreen = SCREEN_STATUS;
+            if (btnCPressed()) currentScreen = SCREEN_STATUS;
         }
         break;
 
     case SCREEN_STATUS:
-        if (M5.BtnA.wasPressed()) currentScreen = SCREEN_HOME;
+        if (btnAPressed()) currentScreen = SCREEN_HOME;
         break;
 
     case SCREEN_CONFIG:
-        if (M5.BtnA.wasPressed()) currentScreen = SCREEN_HOME;
-        if (M5.BtnB.wasPressed()) {
+        if (btnAPressed()) currentScreen = SCREEN_HOME;
+        if (btnBPressed()) {
             durEditPending = recordDurationSec;   // seed picker with live value
             currentScreen  = SCREEN_DURATION;
         }
-        if (M5.BtnC.wasPressed()) {
+        if (btnCPressed()) {
             wifiWasConnected = wifiConnected;
             wifiPhase        = WPHASE_SCANNING;
             currentScreen    = SCREEN_WIFI;
@@ -2739,7 +2770,7 @@ void handleButtons() {
         break;
 
     case SCREEN_DURATION:
-        if (M5.BtnA.wasPressed()) {
+        if (btnAPressed()) {
             // LESS — decrease by 5 s, clamp at minimum
             if (durEditPending > MIN_RECORD_DURATION_SEC) {
                 uint32_t next = durEditPending - 5;
@@ -2747,7 +2778,7 @@ void handleButtons() {
                                  ? MIN_RECORD_DURATION_SEC : next;
             }
         }
-        if (M5.BtnC.wasPressed()) {
+        if (btnCPressed()) {
             // MORE — increase by 5 s, clamp at maximum
             if (durEditPending < MAX_RECORD_DURATION_SEC) {
                 uint32_t next = durEditPending + 5;
@@ -2755,7 +2786,7 @@ void handleButtons() {
                                  ? MAX_RECORD_DURATION_SEC : next;
             }
         }
-        if (M5.BtnB.wasPressed()) {
+        if (btnBPressed()) {
             // SAVE — commit and free old buffers so they reallocate at new size
             if (appState == STATE_RECORDING || appState == STATE_CONTINUOUS ||
                 appState == STATE_ENCODING  || appState == STATE_UPLOADING) {
@@ -3089,6 +3120,7 @@ void setup() {
 void loop() {
     yield();
     M5.update();
+    updateTouchButtons();
     checkSerial();
 
     unsigned long now = millis();

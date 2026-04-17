@@ -32,6 +32,10 @@
   // Camera (GC0308) is available on CoreS3
   #define HAS_CAMERA  1
 
+  // CoreS3 has a touchscreen but no physical buttons below the display.
+  // Touch zones on the screen must be mapped to virtual BtnA/B/C.
+  #define TOUCH_SCREEN_BUTTONS 1
+
 #elif defined(ARDUINO_M5STACK_CORE2)
 
   // ---- M5Stack Core2 (default) ----------------------------------------------
@@ -50,6 +54,9 @@
 
   // No camera on Core2
   #define HAS_CAMERA  0
+
+  // Core2 has physical capacitive buttons — no touch mapping needed
+  #define TOUCH_SCREEN_BUTTONS 0
 
 #else
   #error "Unsupported board. Build with --fqbn esp32:esp32:m5stack_core2 or esp32:esp32:m5stack_cores3"
