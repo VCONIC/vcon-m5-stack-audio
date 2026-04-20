@@ -3812,7 +3812,14 @@ void setup() {
     }
 
 #if HAS_CAMERA
-    initCamera();
+    // Camera init disabled on CoreS3 in 1.0.9: esp_camera_init() fails with 0x103
+    // because the sccb-ng driver tries to create a new I2C master on port 1, which
+    // M5Unified has already acquired. The failed init damages the shared internal
+    // bus, causing the FT6336 touch controller to return saturated garbage reads.
+    // Thumbnails are skipped (captureSnapshot() no-ops when cameraReady is false).
+    // Fix requires deeper work — likely pre-M5.begin() camera init or a driver that
+    // adopts an existing bus handle instead of installing a new one.
+    // initCamera();
 #endif
 
     M5.Display.setCursor(40, 130);
