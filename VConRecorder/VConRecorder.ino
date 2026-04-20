@@ -1,10 +1,13 @@
 
 // =============================================================================
-// M5Stack Core2 — vCon Audio Recorder  (VConic)
+// M5Stack vCon Audio Recorder  (VConic)
 // =============================================================================
+// Supports: M5Stack Core2, M5Stack CoreS3
+//
 // Records audio from the built-in microphone and POSTs a spec-compliant
 // vCon JSON (IETF draft-ietf-vcon-vcon-core) to a configured endpoint.
 // Audio is embedded inline as base64url-encoded WAV.
+// On CoreS3 a camera thumbnail is captured and included as an attachment.
 //
 // Serial Commands (115200 baud):
 //   wifi <ssid> <password>  — Set WiFi credentials (saved to flash)
@@ -13,10 +16,10 @@
 //   restart                 — Restart device
 //   help                    — Show available commands
 //
-// Capacitive touch buttons (below screen):
-//   Left  (A) = RUN     Start recording, then auto-encode + upload
-//   Center(B) = STOP    Stop recording early (encodes + uploads partial audio)
-//   Right (C) = CONFIG  Show configuration screen
+// Buttons (BtnA / BtnB / BtnC):
+//   A = RUN     Start recording, then auto-encode + upload
+//   B = STOP    Stop recording early (encodes + uploads partial audio)
+//   C = CONFIG  Show configuration screen
 // =============================================================================
 
 #include <M5Unified.h>
@@ -29,9 +32,14 @@
 #include "esp_mac.h"
 #include <SD.h>
 #include "config.h"
+#include "hardware.h"
 #include "shine_mp3.h"
 #include "logo.h"
 #include "ota.h"
+
+#if HAS_CAMERA
+#include "esp_camera.h"
+#endif
 
 // =============================================================================
 // State Machine
@@ -94,6 +102,13 @@ int16_t* audioBuffer      = nullptr;
 size_t   audioBufferIndex = 0;   // samples filled so far
 bool     isRecording      = false;
 unsigned long recordStartMs = 0;
+
+// Camera snapshot (CoreS3 only — PSRAM)
+#if HAS_CAMERA
+bool     cameraReady = false;
+uint8_t* g_snapBuf   = nullptr;   // JPEG snapshot taken at recording start
+size_t   g_snapLen   = 0;
+#endif
 
 // =============================================================================
 // Continuous mode — dual-buffer double-buffered record+upload
@@ -167,6 +182,37 @@ int      levelIdx = 0;
 unsigned long lastDisplayMs = 0;
 const unsigned long DISPLAY_INTERVAL_MS = 300;
 
+// =============================================================================
+// Touch-screen button emulation (CoreS3)
+// =============================================================================
+// CoreS3 has no physical buttons below the screen.  We map taps in the
+// on-screen button row (y >= UI_BTN_Y) to virtual BtnA / BtnB / BtnC.
+// State is computed once per frame in updateTouchButtons() before any
+// button-check code runs.  On Core2 this compiles away to nothing.
+// =============================================================================
+#if TOUCH_SCREEN_BUTTONS
+static bool g_touchA = false, g_touchB = false, g_touchC = false;
+
+void updateTouchButtons() {
+    g_touchA = g_touchB = g_touchC = false;
+    auto t = M5.Touch.getDetail();
+    if (t.wasPressed() && t.y >= UI_BTN_Y) {
+        int zone = t.x * 3 / SCREEN_W;
+        if (zone == 0)      g_touchA = true;
+        else if (zone == 1) g_touchB = true;
+        else                g_touchC = true;
+    }
+}
+inline bool btnAPressed() { return M5.BtnA.wasPressed() || g_touchA; }
+inline bool btnBPressed() { return M5.BtnB.wasPressed() || g_touchB; }
+inline bool btnCPressed() { return M5.BtnC.wasPressed() || g_touchC; }
+#else
+inline void updateTouchButtons() {}
+inline bool btnAPressed() { return M5.BtnA.wasPressed(); }
+inline bool btnBPressed() { return M5.BtnB.wasPressed(); }
+inline bool btnCPressed() { return M5.BtnC.wasPressed(); }
+#endif
+
 // Full-screen off-screen canvas for flicker-free rendering.
 // All draw functions paint into this sprite; updateDisplay() pushes the
 // completed frame to the physical display in one transfer so intermediate
@@ -188,6 +234,8 @@ enum UIScreen : uint8_t {
 };
 
 UIScreen currentScreen = SCREEN_HOME;
+
+static void exitWifiPicker(UIScreen dest);
 
 // Inactivity timer — return to HOME after 60 s without a button press
 unsigned long lastButtonMs           = 0;
@@ -414,18 +462,17 @@ void checkWiFi() {
 void initSD() {
     // M5Unified uses LovyanGFX's own SPI driver for the display; it does NOT
     // initialise the Arduino SPI object. We must call SPI.begin() ourselves
-    // with the Core2's VSPI pins before passing that bus to SD.begin().
-    //
-    // Core2 VSPI: CLK=18, MISO=38, MOSI=23, SD-CS=4
-    SPI.begin(18, 38, 23, 4);
+    // with the board's SPI pins before passing that bus to SD.begin().
+    // Pin mapping is defined in hardware.h per board variant.
+    SPI.begin(SD_PIN_CLK, SD_PIN_MISO, SD_PIN_MOSI, SD_PIN_CS);
     delay(10);
 
     // Try at 25 MHz first; drop to 4 MHz on failure (some cards need slower)
-    if (!SD.begin(4, SPI, 25000000)) {
+    if (!SD.begin(SD_PIN_CS, SPI, 25000000)) {
         Serial.println("[sd] 25 MHz init failed, retrying at 4 MHz...");
         SD.end();
         delay(50);
-        if (!SD.begin(4, SPI, 4000000)) {
+        if (!SD.begin(SD_PIN_CS, SPI, 4000000)) {
             Serial.println("[sd] Card init failed — not present or needs FAT32 format");
             sdReady    = false;
             sdCardInfo = "No card";
@@ -727,6 +774,70 @@ void generateUUID(char* out) {
 }
 
 // =============================================================================
+// Camera (CoreS3 only)
+// =============================================================================
+#if HAS_CAMERA
+
+void initCamera() {
+    camera_config_t config = {};
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer   = LEDC_TIMER_0;
+    config.pin_d0       = 39;
+    config.pin_d1       = 40;
+    config.pin_d2       = 41;
+    config.pin_d3       = 42;
+    config.pin_d4       = 15;
+    config.pin_d5       = 16;
+    config.pin_d6       = 48;
+    config.pin_d7       = 47;
+    config.pin_xclk     = 2;
+    config.pin_pclk     = 45;
+    config.pin_vsync    = 46;
+    config.pin_href     = 38;
+    config.pin_sccb_sda = 12;
+    config.pin_sccb_scl = 11;
+    config.pin_pwdn     = -1;
+    config.pin_reset    = -1;
+    config.xclk_freq_hz = 20000000;
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.frame_size   = FRAMESIZE_QVGA;   // 320x240 — matches display
+    config.jpeg_quality = 12;                // decent quality, ~15-25 KB
+    config.fb_count     = 1;
+    config.fb_location  = CAMERA_FB_IN_PSRAM;
+    config.grab_mode    = CAMERA_GRAB_LATEST;
+
+    esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        Serial.printf("[cam] init failed: 0x%x\n", err);
+        cameraReady = false;
+        return;
+    }
+    cameraReady = true;
+    Serial.println("[cam] GC0308 ready (QVGA JPEG)");
+}
+
+// Capture a single JPEG frame into PSRAM.  Called once at recording start.
+void captureSnapshot() {
+    if (!cameraReady) return;
+    if (g_snapBuf) { free(g_snapBuf); g_snapBuf = nullptr; g_snapLen = 0; }
+
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) { Serial.println("[cam] snapshot failed"); return; }
+
+    g_snapBuf = (uint8_t*)ps_malloc(fb->len);
+    if (g_snapBuf) {
+        memcpy(g_snapBuf, fb->buf, fb->len);
+        g_snapLen = fb->len;
+        Serial.printf("[cam] snapshot: %zu bytes JPEG\n", g_snapLen);
+    } else {
+        Serial.println("[cam] ps_malloc snapshot failed");
+    }
+    esp_camera_fb_return(fb);
+}
+
+#endif // HAS_CAMERA
+
+// =============================================================================
 // Audio Recording
 // =============================================================================
 
@@ -743,7 +854,7 @@ bool allocateAudioBuffer() {
     // Free any existing buffer — size may have changed via 'dur' command
     if (audioBufA) { free(audioBufA); audioBufA = nullptr; audioBuffer = nullptr; }
     if (!psramFound()) {
-        Serial.println("[audio] FATAL: No PSRAM. Core2 requires PSRAM for audio buffer.");
+        Serial.println("[audio] FATAL: No PSRAM. Device requires PSRAM for audio buffer.");
         lastStatus = "No PSRAM detected!";
         return false;
     }
@@ -916,6 +1027,12 @@ void finishSdRecording() {
 void startRecording() {
     // Decide: SD-streaming or legacy PSRAM path
     sdStreamMode = shouldUseSdStream();
+
+    // Capture a camera thumbnail before mic DMA starts (CoreS3 only).
+    // Done once per recording session; continuous-mode chunks reuse the first snap.
+#if HAS_CAMERA
+    if (!continuousMode || continuousChunks == 0) captureSnapshot();
+#endif
 
     if (sdStreamMode) {
         // SD-streaming: no PSRAM audio buffers needed
@@ -1497,7 +1614,7 @@ bool buildAndUploadVConCore(const int16_t* buf, size_t numSamples) {
 
     char tagsRaw[320];
     snprintf(tagsRaw, sizeof(tagsRaw),
-             "{\"source\":\"m5stack-core2\","
+             "{\"source\":\"" DEVICE_TYPE_STR "\","
              "\"device_id\":\"%s\","
              "\"mac\":\"%s\","
              "\"sample_rate\":%d,"
@@ -1520,7 +1637,7 @@ bool buildAndUploadVConCore(const int16_t* buf, size_t numSamples) {
             "\"meta\":{"
               "\"device_id\":\"%s\","
               "\"vconic_id\":\"%s\","
-              "\"device_type\":\"m5stack-core2\""
+              "\"device_type\":\"" DEVICE_TYPE_STR "\""
             "}"
           "}],"
           "\"dialog\":[{"
@@ -1536,19 +1653,82 @@ bool buildAndUploadVConCore(const int16_t* buf, size_t numSamples) {
         uuidStr, timestamp, macStr.c_str(), deviceID.c_str(), timestamp,
         (unsigned)(numSamples / SAMPLE_RATE));
 
-    char suffix[640];
-    int suffixLen = snprintf(suffix, sizeof(suffix),
-        "\"}],"
-        "\"analysis\":[],"
-        "\"attachments\":[{"
-          "\"purpose\":\"tags\","
-          "\"start\":\"%s\","
-          "\"party\":0,"
-          "\"dialog\":0,"
-          "\"encoding\":\"json\","
-          "\"body\":\"%s\""
-        "}]}",
-        timestamp, tagsEsc);
+    // ---- Build suffix (closes dialog body, adds attachments) ---------------
+    // The suffix is heap-allocated because the optional camera thumbnail
+    // attachment can add ~30 KB of base64url data (CoreS3 only).
+    char* snapB64 = nullptr;
+    size_t snapB64Len = 0;
+
+#if HAS_CAMERA
+    if (g_snapBuf && g_snapLen > 0) {
+        size_t maxB64 = ((g_snapLen + 2) / 3) * 4 + 1;
+        uint8_t* b64Tmp = (uint8_t*)ps_malloc(maxB64);
+        if (b64Tmp) {
+            size_t rawLen = 0;
+            mbedtls_base64_encode(b64Tmp, maxB64, &rawLen, g_snapBuf, g_snapLen);
+            // Convert standard base64 → base64url in-place
+            for (size_t i = 0; i < rawLen; i++) {
+                uint8_t c = b64Tmp[i];
+                if (c == '=') break;
+                if (c == '+') c = '-';
+                else if (c == '/') c = '_';
+                b64Tmp[snapB64Len++] = c;
+            }
+            b64Tmp[snapB64Len] = '\0';
+            snapB64 = (char*)b64Tmp;
+            Serial.printf("[cam] thumbnail base64url: %zu bytes\n", snapB64Len);
+        }
+        free(g_snapBuf); g_snapBuf = nullptr; g_snapLen = 0;
+    }
+#endif
+
+    size_t suffixBufSize = 768 + snapB64Len;
+    char* suffix = (char*)ps_malloc(suffixBufSize);
+    if (!suffix) {
+        if (snapB64) free(snapB64);
+        Serial.println("[vcon] ps_malloc suffix failed");
+        uploadTaskState = UTS_DONE_FAIL;
+        return false;
+    }
+
+    int suffixLen;
+    if (snapB64) {
+        suffixLen = snprintf(suffix, suffixBufSize,
+            "\"}],"
+            "\"analysis\":[],"
+            "\"attachments\":[{"
+              "\"purpose\":\"tags\","
+              "\"start\":\"%s\","
+              "\"party\":0,"
+              "\"dialog\":0,"
+              "\"encoding\":\"json\","
+              "\"body\":\"%s\""
+            "},{"
+              "\"purpose\":\"thumbnail\","
+              "\"start\":\"%s\","
+              "\"party\":0,"
+              "\"dialog\":0,"
+              "\"mimetype\":\"image/jpeg\","
+              "\"encoding\":\"base64url\","
+              "\"body\":\"%s\""
+            "}]}",
+            timestamp, tagsEsc,
+            timestamp, snapB64);
+        free(snapB64); snapB64 = nullptr;
+    } else {
+        suffixLen = snprintf(suffix, suffixBufSize,
+            "\"}],"
+            "\"analysis\":[],"
+            "\"attachments\":[{"
+              "\"purpose\":\"tags\","
+              "\"start\":\"%s\","
+              "\"party\":0,"
+              "\"dialog\":0,"
+              "\"encoding\":\"json\","
+              "\"body\":\"%s\""
+            "}]}",
+            timestamp, tagsEsc);
+    }
 
     // ---- Save WAV to SD (before large PSRAM allocs) ----------------------
     uploadTaskState = UTS_SD;
@@ -1563,6 +1743,7 @@ bool buildAndUploadVConCore(const int16_t* buf, size_t numSamples) {
 
     char* jsonBuf = (char*)ps_malloc(jsonBufSize);
     if (!jsonBuf) {
+        free(suffix);
         Serial.printf("[vcon] ps_malloc json (%zu) failed. FreePS:%u\n",
                       jsonBufSize, ESP.getFreePsram());
         uploadTaskState = UTS_DONE_FAIL;
@@ -1572,6 +1753,7 @@ bool buildAndUploadVConCore(const int16_t* buf, size_t numSamples) {
 
     uint8_t* wavBuf = (uint8_t*)ps_malloc(wavBytes);
     if (!wavBuf) {
+        free(suffix);
         free(jsonBuf);
         Serial.printf("[vcon] ps_malloc WAV (%u) failed. FreePS:%u\n",
                       wavBytes, ESP.getFreePsram());
@@ -1590,6 +1772,7 @@ bool buildAndUploadVConCore(const int16_t* buf, size_t numSamples) {
     free(wavBuf);   // done with raw WAV
 
     if (mbedRet != 0) {
+        free(suffix);
         free(jsonBuf);
         Serial.printf("[vcon] mbedtls error: %d\n", mbedRet);
         uploadTaskState = UTS_DONE_FAIL;
@@ -1609,6 +1792,7 @@ bool buildAndUploadVConCore(const int16_t* buf, size_t numSamples) {
 
     // Append suffix immediately after base64url data
     memcpy(jsonBuf + prefixLen + b64UrlLen, suffix, suffixLen);
+    free(suffix);   // suffix is now in jsonBuf
     size_t jsonLen = (size_t)prefixLen + b64UrlLen + (size_t)suffixLen;
     jsonBuf[jsonLen] = '\0';
 
@@ -2904,22 +3088,22 @@ void handleWifiButtons() {
     case WPHASE_SELECT:
         if (wifiScanCount == 0) {
             // No networks: SCAN or BACK
-            if (M5.BtnA.wasPressed()) {
+            if (btnAPressed()) {
                 wifiPhase = WPHASE_SCANNING;  // re-scan triggered in loop()
             }
-            if (M5.BtnC.wasPressed()) {
+            if (btnCPressed()) {
                 exitWifiPicker(SCREEN_CONFIG);
             }
         } else {
-            if (M5.BtnA.wasPressed()) {
+            if (btnAPressed()) {
                 // BACK — return to config without connecting
                 exitWifiPicker(SCREEN_CONFIG);
             }
-            if (M5.BtnC.wasPressed()) {
+            if (btnCPressed()) {
                 // NEXT (wraps, so all networks reachable without PREV)
                 wifiSelIdx = (wifiSelIdx + 1) % wifiScanCount;
             }
-            if (M5.BtnB.wasPressed()) {
+            if (btnBPressed()) {
                 // SELECT — open networks skip password
                 if (wifiScanOpen[wifiSelIdx]) {
                     wifiPwdBuf = "";
@@ -2934,16 +3118,16 @@ void handleWifiButtons() {
         break;
 
     case WPHASE_PASSWORD:
-        if (M5.BtnA.wasPressed()) {
+        if (btnAPressed()) {
             // PREV char
             if (wifiCharIdx == 0) wifiCharIdx = WIFI_IDX_TOTAL - 1;
             else wifiCharIdx--;
         }
-        if (M5.BtnC.wasPressed()) {
+        if (btnCPressed()) {
             // NEXT char
             wifiCharIdx = (wifiCharIdx + 1) % WIFI_IDX_TOTAL;
         }
-        if (M5.BtnB.wasPressed()) {
+        if (btnBPressed()) {
             // ADD / action
             if (wifiCharIdx == WIFI_IDX_DONE) {
                 // Done — connect
@@ -2965,11 +3149,11 @@ void handleWifiButtons() {
         break;
 
     case WPHASE_RESULT:
-        if (M5.BtnA.wasPressed()) {
+        if (btnAPressed()) {
             // SCAN again
             wifiPhase = WPHASE_SCANNING;
         }
-        if (M5.BtnC.wasPressed()) {
+        if (btnCPressed()) {
             exitWifiPicker(SCREEN_HOME);
         }
         if ((millis() - wifiResultMs) > TOOLS_RESULT_TIMEOUT_MS) {
@@ -3114,10 +3298,10 @@ void toolsRunSelected() {
 void handleToolsButtons() {
     switch (toolsPhase) {
     case TPHASE_SELECT:
-        if (M5.BtnA.wasPressed()) {
+        if (btnAPressed()) {
             toolsSelectedItem = (toolsSelectedItem + TOOL_COUNT - 1) % TOOL_COUNT;
         }
-        if (M5.BtnB.wasPressed()) {
+        if (btnBPressed()) {
             if (appState == STATE_RECORDING || appState == STATE_CONTINUOUS) {
                 toolsResultOK    = false;
                 toolsResultLine1 = "Stop recording first";
@@ -3131,18 +3315,18 @@ void handleToolsButtons() {
                 // toolsRunSelected() is called from loop() on next iteration
             }
         }
-        if (M5.BtnC.wasPressed()) {
+        if (btnCPressed()) {
             currentScreen = SCREEN_HOME;
         }
         break;
 
     case TPHASE_CONFIRM:
-        if (M5.BtnB.wasPressed()) {
+        if (btnBPressed()) {
             Serial.println("[tools] User-initiated restart");
             delay(200);
             ESP.restart();
         }
-        if (M5.BtnC.wasPressed()) {
+        if (btnCPressed()) {
             toolsPhase    = TPHASE_SELECT;
             currentScreen = SCREEN_HOME;
         }
@@ -3153,8 +3337,8 @@ void handleToolsButtons() {
         break;
 
     case TPHASE_RESULT:
-        if (M5.BtnB.wasPressed()) toolsPhase = TPHASE_SELECT;
-        if (M5.BtnC.wasPressed()) {
+        if (btnBPressed()) toolsPhase = TPHASE_SELECT;
+        if (btnCPressed()) {
             toolsPhase    = TPHASE_SELECT;
             currentScreen = SCREEN_HOME;
         }
@@ -3166,7 +3350,7 @@ void handleToolsButtons() {
 }
 
 void handleButtons() {
-    bool anyPressed = M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnC.wasPressed();
+    bool anyPressed = btnAPressed() || btnBPressed() || btnCPressed();
     if (anyPressed) lastButtonMs = millis();
 
     // Inactivity auto-return to HOME
@@ -3185,7 +3369,7 @@ void handleButtons() {
 
     case SCREEN_HOME:
         if (idle) {
-            if (M5.BtnA.wasPressed()) {
+            if (btnAPressed()) {
                 // RUN — same logic as old BtnA handler
                 checkWiFi();
                 if (shouldUseSdStream()) {
@@ -3216,10 +3400,10 @@ void handleButtons() {
                     startRecording();
                 }
             }
-            if (M5.BtnB.wasPressed()) currentScreen = SCREEN_CONFIG;
-            if (M5.BtnC.wasPressed()) currentScreen = SCREEN_TOOLS;
+            if (btnBPressed()) currentScreen = SCREEN_CONFIG;
+            if (btnCPressed()) currentScreen = SCREEN_TOOLS;
         } else if (activeRec) {
-            if (M5.BtnB.wasPressed()) {
+            if (btnBPressed()) {
                 // STOP — same logic as old BtnB handler
                 if (appState == STATE_CONTINUOUS) {
                     stopContinuous = true;
@@ -3250,24 +3434,24 @@ void handleButtons() {
                     }
                 }
             }
-            if (M5.BtnC.wasPressed()) currentScreen = SCREEN_STATUS;
+            if (btnCPressed()) currentScreen = SCREEN_STATUS;
         } else {
             // ENCODING / UPLOADING
-            if (M5.BtnC.wasPressed()) currentScreen = SCREEN_STATUS;
+            if (btnCPressed()) currentScreen = SCREEN_STATUS;
         }
         break;
 
     case SCREEN_STATUS:
-        if (M5.BtnA.wasPressed()) currentScreen = SCREEN_HOME;
+        if (btnAPressed()) currentScreen = SCREEN_HOME;
         break;
 
     case SCREEN_CONFIG:
-        if (M5.BtnA.wasPressed()) currentScreen = SCREEN_HOME;
-        if (M5.BtnB.wasPressed()) {
+        if (btnAPressed()) currentScreen = SCREEN_HOME;
+        if (btnBPressed()) {
             durEditPending = recordDurationSec;   // seed picker with live value
             currentScreen  = SCREEN_DURATION;
         }
-        if (M5.BtnC.wasPressed()) {
+        if (btnCPressed()) {
             wifiWasConnected = wifiConnected;
             wifiPhase        = WPHASE_SCANNING;
             currentScreen    = SCREEN_WIFI;
@@ -3275,10 +3459,8 @@ void handleButtons() {
         break;
 
     case SCREEN_DURATION: {
-        // Step size: 5s for <=120s, 60s for >120s
-        uint32_t step = (durEditPending > 120) ? 60 : 5;
-        if (M5.BtnA.wasPressed()) {
-            // LESS
+        if (btnAPressed()) {
+            // LESS — decrease by 5 s, clamp at minimum
             if (durEditPending > MIN_RECORD_DURATION_SEC) {
                 uint32_t s = (durEditPending <= 120) ? 5 : 60;
                 uint32_t next = (durEditPending > s) ? durEditPending - s : MIN_RECORD_DURATION_SEC;
@@ -3286,8 +3468,8 @@ void handleButtons() {
                                  ? MIN_RECORD_DURATION_SEC : next;
             }
         }
-        if (M5.BtnC.wasPressed()) {
-            // MORE
+        if (btnCPressed()) {
+            // MORE — increase by 5 s, clamp at maximum
             if (durEditPending < MAX_RECORD_DURATION_SEC) {
                 uint32_t s = (durEditPending >= 120) ? 60 : 5;
                 uint32_t next = durEditPending + s;
@@ -3295,7 +3477,7 @@ void handleButtons() {
                                  ? MAX_RECORD_DURATION_SEC : next;
             }
         }
-        if (M5.BtnB.wasPressed()) {
+        if (btnBPressed()) {
             // SAVE — commit and free old buffers so they reallocate at new size
             if (appState == STATE_RECORDING || appState == STATE_CONTINUOUS ||
                 appState == STATE_ENCODING  || appState == STATE_UPLOADING) {
@@ -3488,7 +3670,7 @@ void handleSerialCommand(const String& cmd) {
         delay(500);
         ESP.restart();
     } else if (cmd == "help") {
-        Serial.println("\n=== M5Stack Core2 vCon Recorder ===");
+        Serial.printf("\n=== %s vCon Recorder ===\n", BOARD_NAME);
         Serial.println("wifi  <ssid> <password>  Set WiFi credentials");
         Serial.println("url   <post_url>          Set vCon POST URL");
         Serial.println("token <dvt_xxx>           Set portal device token (token routing)");
@@ -3564,7 +3746,7 @@ void setup() {
 
     Serial.begin(115200);
     delay(300);
-    Serial.println("\n\n=== M5Stack Core2 vCon Recorder (VConic) ===");
+    Serial.printf("\n\n=== %s vCon Recorder (VConic) ===\n", BOARD_NAME);
     Serial.println("Type 'help' for available commands.\n");
 
     M5.Display.setBrightness(160);
@@ -3592,7 +3774,7 @@ void setup() {
     M5.Display.setCursor(40, 120);
     M5.Display.print("Initializing...");
 
-    // PSRAM check — Core2 requires it for the 960 KB audio buffer
+    // PSRAM check — required for the audio buffer (both Core2 and CoreS3 have 8 MB)
     if (!psramFound()) {
         M5.Display.fillScreen(TFT_RED);
         M5.Display.setTextColor(TFT_WHITE, TFT_RED);
@@ -3602,7 +3784,7 @@ void setup() {
         M5.Display.setCursor(20, 110);
         M5.Display.print("This firmware");
         M5.Display.setCursor(20, 130);
-        M5.Display.print("requires Core2");
+        M5.Display.print("requires PSRAM");
         while (true) delay(1000);
     }
     Serial.printf("[init] PSRAM: %u bytes total, %u bytes free\n",
@@ -3628,6 +3810,17 @@ void setup() {
     } else {
         Serial.println("[init] Microphone OK");
     }
+
+#if HAS_CAMERA
+    // Camera init disabled on CoreS3 in 1.0.9: esp_camera_init() fails with 0x103
+    // because the sccb-ng driver tries to create a new I2C master on port 1, which
+    // M5Unified has already acquired. The failed init damages the shared internal
+    // bus, causing the FT6336 touch controller to return saturated garbage reads.
+    // Thumbnails are skipped (captureSnapshot() no-ops when cameraReady is false).
+    // Fix requires deeper work — likely pre-M5.begin() camera init or a driver that
+    // adopts an existing bus handle instead of installing a new one.
+    // initCamera();
+#endif
 
     M5.Display.setCursor(40, 130);
     M5.Display.setTextSize(1);
@@ -3668,6 +3861,7 @@ void setup() {
 void loop() {
     yield();
     M5.update();
+    updateTouchButtons();
     checkSerial();
 
     unsigned long now = millis();

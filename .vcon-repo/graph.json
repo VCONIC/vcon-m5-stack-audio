@@ -3,9 +3,9 @@
   "repo": "vcon-m5-stack-audio",
   "repo_version": null,
   "archetype": "firmware",
-  "generated_at": "2026-04-17T12:29:51.830732+00:00",
+  "generated_at": "2026-04-18T12:29:43.758541+00:00",
   "stats": {
-    "node_count": 9,
+    "node_count": 10,
     "edge_count": 0
   },
   "nodes": [
@@ -14,6 +14,12 @@
       "type": "component",
       "name": "config",
       "file": "VConRecorder/config.h"
+    },
+    {
+      "id": "component:hardware",
+      "type": "component",
+      "name": "hardware",
+      "file": "VConRecorder/hardware.h"
     },
     {
       "id": "component:logo",

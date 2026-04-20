@@ -2,8 +2,9 @@
 #define CONFIG_H
 
 // =============================================================================
-// M5Stack Core2 vCon Recorder — Configuration
+// M5Stack vCon Recorder — Configuration
 // =============================================================================
+// Supports: Core2, CoreS3.  Board-specific constants are in hardware.h.
 // Edit defaults here, or use the serial interface to change at runtime.
 // All settings are persisted to flash via Preferences.
 //
@@ -34,9 +35,8 @@
 // when this build is the current release.
 #define FIRMWARE_VERSION      "1.0.9"
 
-// OTA endpoints — served as static files from the same Replit host
-#define OTA_VERSION_URL       "https://vcon-gateway.replit.app/api/ota/version.txt"
-#define OTA_FIRMWARE_URL      "https://vcon-gateway.replit.app/api/ota/firmware.bin"
+// OTA endpoints — board-specific, defined in hardware.h
+// (Core2 and CoreS3 use separate /api/ota/<board>/ paths to prevent cross-flash)
 
 // VConic portal device token (optional).
 // When set, appended as ?token=<value> and sent as X-Device-Token header.
@@ -73,7 +73,7 @@
 //   Single-shot peak  : D × 53.3 KB   →  60 s ≈ 3.2 MB  ✓  120 s ≈ 6.4 MB  ✓/⚠
 //   Continuous peak   : D × 69.3 KB   →  60 s ≈ 4.2 MB  ✓  > 60 s exceeds ~4 MB  ✗
 //
-// Core2 has 8 MB PSRAM; ~4–5 MB is available after IDF/WiFi/mbedtls overhead.
+// Core2 and CoreS3 both have 8 MB PSRAM; ~4–5 MB available after IDF/WiFi overhead.
 
 // SD-streaming mode — records directly to SD card, bypassing PSRAM audio
 // buffers entirely.  Removes the PSRAM-imposed duration ceiling and supports
@@ -92,7 +92,7 @@
 #define B64_RAW_CHUNK_SIZE      3072  // must be divisible by 3 for clean base64
 #define B64_ENC_CHUNK_SIZE      4096  // B64_RAW_CHUNK_SIZE * 4/3
 
-// Display (M5Stack Core2 built-in LCD)
+// Display (320×240 on both Core2 and CoreS3)
 #define SCREEN_W  320
 #define SCREEN_H  240
 
